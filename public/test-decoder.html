@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>测试解码服务</title>
+</head>
+<body>
+    <h1>测试解码服务连接</h1>
+    <button onclick="testDecoder()">测试解码服务</button>
+    <pre id="result"></pre>
+    
+    <script>
+        async function testDecoder() {
+            const resultEl = document.getElementById('result');
+            resultEl.textContent = '测试中...\n';
+            
+            try {
+                // 测试1: 健康检查
+                resultEl.textContent += '1. 测试健康检查...\n';
+                const healthResponse = await fetch('http://localhost:8083/health');
+                const healthData = await healthResponse.json();
+                resultEl.textContent += `   结果: ${JSON.stringify(healthData)}\n\n`;
+                
+                // 测试2: 解码请求
+                resultEl.textContent += '2. 测试解码请求...\n';
+                const decodeUrl = 'http://localhost:8083/decode?scene_id=42899936&object_id=4f3e2219-650e-428c-b98d-ccef48fd2539&texture=true';
+                resultEl.textContent += `   URL: ${decodeUrl}\n`;
+                const decodeResponse = await fetch(decodeUrl);
+                const decodeData = await decodeResponse.json();
+                resultEl.textContent += `   结果: ${JSON.stringify(decodeData, null, 2)}\n\n`;
+                
+                // 测试3: 访问GLB文件
+                if (decodeData.success && decodeData.mesh_url) {
+                    resultEl.textContent += '3. 测试GLB文件访问...\n';
+                    const glbUrl = `http://localhost:8083${decodeData.mesh_url}`;
+                    resultEl.textContent += `   URL: ${glbUrl}\n`;
+                    const glbResponse = await fetch(glbUrl, { method: 'HEAD' });
+                    resultEl.textContent += `   状态: ${glbResponse.status} ${glbResponse.statusText}\n`;
+                    resultEl.textContent += `   Content-Type: ${glbResponse.headers.get('Content-Type')}\n`;
+                }
+                
+                resultEl.textContent += '\n✓ 所有测试通过！';
+            } catch (error) {
+                resultEl.textContent += `\n✗ 错误: ${error.message}\n`;
+                resultEl.textContent += `详细信息: ${error.stack}\n`;
+            }
+        }
+    </script>
+</body>
+</html>
