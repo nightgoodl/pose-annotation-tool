@@ -17,7 +17,7 @@ import { ControlPanel } from './ControlPanel';
 import type { AnnotationInput, Matrix4 } from '../types';
 
 // 数据服务器地址
-const DATA_SERVER = 'http://localhost:8082';
+const DATA_SERVER = 'http://localhost:8081';
 // 解码服务通过数据服务器代理访问
 
 // 已对齐物体的类型

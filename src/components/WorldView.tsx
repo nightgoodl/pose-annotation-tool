@@ -273,7 +273,7 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
         const meshMatrix = mesh.matrixWorld;
         
         const vertCount = positions.count;
-        const maxTris = 10000;  // 增加三角形数量使线框更密集
+        const maxTris = 5000;  // 减少三角形数量提升性能
         const meshVertices: { x: number; y: number; z: number }[] = [];
         
         // 提取所有顶点
@@ -428,7 +428,7 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
     const minV = Math.max(0, Math.floor(Math.min(...hull.map(p => p.y))));
     const maxV = Math.min(imageHeight - 1, Math.ceil(Math.max(...hull.map(p => p.y))));
     
-    // 3. 遍历边界框内的像素，计算IoU
+    // 3. 使用采样计算IoU（性能优化）
     let intersection = 0;
     let projectionArea = 0;
     let maskArea = 0;
@@ -437,8 +437,11 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
     const scaleX = maskWidth / imageWidth;
     const scaleY = maskHeight / imageHeight;
     
-    for (let v = minV; v <= maxV; v++) {
-      for (let u = minU; u <= maxU; u++) {
+    // 采样步长（每隔几个像素采样一次）
+    const sampleStep = Math.max(1, Math.floor(Math.max(imageWidth, imageHeight) / 200));
+    
+    for (let v = minV; v <= maxV; v += sampleStep) {
+      for (let u = minU; u <= maxU; u += sampleStep) {
         const inProjection = isPointInPolygon({ x: u, y: v }, hull);
         
         // 获取mask值（缩放坐标）
@@ -454,9 +457,9 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
       }
     }
     
-    // 也需要统计边界框外的mask区域
-    for (let v = 0; v < imageHeight; v++) {
-      for (let u = 0; u < imageWidth; u++) {
+    // 也需要统计边界框外的mask区域（使用采样）
+    for (let v = 0; v < imageHeight; v += sampleStep) {
+      for (let u = 0; u < imageWidth; u += sampleStep) {
         if (u >= minU && u <= maxU && v >= minV && v <= maxV) continue; // 已统计
         
         const maskU = Math.round(u * scaleX);
@@ -474,11 +477,18 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
     onIoUCalculated(iou);
   }, [maskData, projectedData, onIoUCalculated, imageWidth, imageHeight]);
   
+  // 计算凸包（用于渲染）
+  const hull = useMemo(() => {
+    if (projectedData.vertices.length < 3) return [];
+    const points = projectedData.vertices.map(v => ({ x: v.u, y: v.v }));
+    return computeConvexHull(points);
+  }, [projectedData.vertices]);
+  
   if (loading) {
     return null;
   }
   
-  if (projectedData.edges.length === 0) {
+  if (projectedData.vertices.length === 0) {
     return null;
   }
   
@@ -488,7 +498,16 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
       viewBox={`0 0 ${imageWidth} ${imageHeight}`}
       preserveAspectRatio="xMidYMid meet"
     >
-      {/* 绘制模型边缘 */}
+      {/* 1. 凸包半透明填充 - 淡蓝色 */}
+      {hull.length >= 3 && (
+        <polygon
+          points={hull.map(p => `${p.x},${p.y}`).join(' ')}
+          fill="rgba(100, 180, 255, 0.2)"
+          stroke="none"
+        />
+      )}
+      
+      {/* 2. 绘制模型边缘线框 - 绿色 */}
       {projectedData.edges.map((edge: { p1: { u: number; v: number }; p2: { u: number; v: number } }, idx: number) => (
         <line
           key={idx}
@@ -496,11 +515,22 @@ function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWid
           y1={edge.p1.v}
           x2={edge.p2.u}
           y2={edge.p2.v}
-          stroke="#00aa00"
+          stroke="#00cc00"
           strokeWidth="1"
           opacity="0.6"
         />
       ))}
+      
+      {/* 3. 凸包醒目边框 - 亮黄色 */}
+      {hull.length >= 3 && (
+        <polygon
+          points={hull.map(p => `${p.x},${p.y}`).join(' ')}
+          fill="none"
+          stroke="#ffff00"
+          strokeWidth="3"
+          opacity="0.9"
+        />
+      )}
     </svg>
   );
 }
