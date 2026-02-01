@@ -12,5 +12,23 @@ export default defineConfig({
   server: {
     port: 3000,
     host: true,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8084',
+        changeOrigin: true,
+      },
+      '/data': {
+        target: 'http://localhost:8084',
+        changeOrigin: true,
+      },
+    },
+  },
+  build: {
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, 'index.html'),
+        mv: path.resolve(__dirname, 'index-mv.html'),
+      },
+    },
   },
 })

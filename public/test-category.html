@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>分类状态测试</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white p-8">
+    <h1 class="text-2xl font-bold mb-4">对象分类状态测试</h1>
+    
+    <div class="mb-4 space-x-2">
+        <button onclick="loadData()" class="px-4 py-2 bg-blue-600 rounded hover:bg-blue-500">
+            刷新数据
+        </button>
+        <button onclick="refreshCache()" class="px-4 py-2 bg-green-600 rounded hover:bg-green-500">
+            刷新后端缓存
+        </button>
+    </div>
+    
+    <div id="status" class="mb-4 p-4 bg-gray-800 rounded"></div>
+    <div id="objects" class="space-y-2"></div>
+    
+    <script>
+        function refreshCache() {
+            document.getElementById('status').textContent = '正在刷新缓存...';
+            fetch('/api/refresh_cache')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('status').textContent = '缓存已刷新: ' + data.message;
+                    setTimeout(loadData, 500);
+                })
+                .catch(err => {
+                    document.getElementById('status').textContent = '刷新缓存失败: ' + err.message;
+                });
+        }
+        
+        function loadData() {
+            const statusDiv = document.getElementById('status');
+            const objectsDiv = document.getElementById('objects');
+            
+            statusDiv.textContent = '正在加载数据...';
+            objectsDiv.innerHTML = '';
+            
+            fetch('/api/mv_objects?page=1&page_size=30&scene=42444908')
+                .then(r => {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(data => {
+                    statusDiv.textContent = `成功加载 ${data.mv_objects.length} 个对象`;
+                    
+                    // 统计分类
+                    const stats = {
+                        invalid: 0,
+                        fixed: 0,
+                        valid: 0,
+                        aligned: 0,
+                        pending: 0
+                    };
+                    
+                    data.mv_objects.forEach(obj => {
+                        const div = document.createElement('div');
+                        div.className = 'flex items-center justify-between p-3 bg-gray-800 rounded hover:bg-gray-700';
+                        
+                        let bgColor = 'bg-gray-600';
+                        let label = '待标注';
+                        let statKey = 'pending';
+                        
+                        if (obj.category === 'invalid') {
+                            bgColor = 'bg-red-600';
+                            label = '无效数据';
+                            statKey = 'invalid';
+                        } else if (obj.category === 'fixed') {
+                            bgColor = 'bg-blue-600';
+                            label = '已对齐';
+                            statKey = 'fixed';
+                        } else if (obj.category === 'valid') {
+                            bgColor = 'bg-yellow-600';
+                            label = '待对齐';
+                            statKey = 'valid';
+                        } else if (obj.has_alignment) {
+                            bgColor = 'bg-green-600';
+                            label = '已对齐';
+                            statKey = 'aligned';
+                        }
+                        
+                        stats[statKey]++;
+                        
+                        div.innerHTML = `
+                            <div class="flex-1">
+                                <div class="font-mono text-sm">${obj.object_id}</div>
+                                <div class="text-xs text-gray-400">
+                                    category: <span class="text-yellow-400">${obj.category || 'null'}</span>, 
+                                    has_alignment: <span class="text-blue-400">${obj.has_alignment}</span>
+                                </div>
+                            </div>
+                            <div class="px-3 py-1 rounded text-xs font-semibold ${bgColor}">${label}</div>
+                        `;
+                        objectsDiv.appendChild(div);
+                    });
+                    
+                    // 显示统计
+                    const statsDiv = document.createElement('div');
+                    statsDiv.className = 'mt-4 p-4 bg-gray-800 rounded';
+                    statsDiv.innerHTML = `
+                        <div class="font-semibold mb-2">统计:</div>
+                        <div class="grid grid-cols-5 gap-2 text-sm">
+                            <div class="text-red-400">无效数据: ${stats.invalid}</div>
+                            <div class="text-blue-400">已对齐(fixed): ${stats.fixed}</div>
+                            <div class="text-yellow-400">待对齐: ${stats.valid}</div>
+                            <div class="text-green-400">已对齐: ${stats.aligned}</div>
+                            <div class="text-gray-400">待标注: ${stats.pending}</div>
+                        </div>
+                    `;
+                    objectsDiv.insertBefore(statsDiv, objectsDiv.firstChild);
+                })
+                .catch(err => {
+                    statusDiv.textContent = '错误: ' + err.message;
+                    statusDiv.className = 'mb-4 p-4 bg-red-900 rounded';
+                });
+        }
+        
+        // 页面加载时自动加载数据
+        loadData();
+    </script>
+</body>
+</html>
