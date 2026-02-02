@@ -755,7 +755,16 @@ export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverU
               zIndex: 100,
               touchAction: 'none'
             }}
-            onClick={handleImageClick}
+            onClick={(e) => {
+              // 缩略图模式：点击图片区域也触发选中
+              if (!enlarged) {
+                onSelect();
+              }
+              // 放大模式或已激活：处理标注点击
+              if (enlarged || (isEnabled && isActive)) {
+                handleImageClick(e);
+              }
+            }}
           />
         </div>
       </div>

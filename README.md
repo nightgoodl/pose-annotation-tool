@@ -1,164 +1,198 @@
 # 6D Pose Annotation Tool
 
-RGB-D 场景物体位姿标注工具，用于将 3D CAD 模型对齐到 2D 图像中的物体。
+A web-based tool for annotating 6D object poses in RGB-D scenes. Supports both single-view and multi-view annotation workflows.
 
-## 项目结构
+## Deployment
+
+### Prerequisites
+
+- Node.js 18+
+- Python 3.8+
+- npm or yarn
+
+### Quick Start
+
+**1. Install frontend dependencies:**
+
+```bash
+cd pose-annotation-tool
+npm install
+```
+
+**2. Start the backend data server:**
+
+```bash
+# For multi-view annotation
+python server/data_server_mv.py 8084
+
+# For single-view annotation
+python server/data_server.py 8084
+```
+
+**3. Start the frontend development server:**
+
+```bash
+# Multi-view tool (recommended)
+npm run dev -- --port 3003
+
+# Access at: http://localhost:3003/index-mv.html
+```
+
+### Production Build
+
+```bash
+npm run build
+# Output in dist/
+```
+
+## Project Structure
 
 ```
 pose-annotation-tool/
 ├── src/
 │   ├── components/
-│   │   ├── App.tsx              # 主应用组件
-│   │   ├── WorldView.tsx        # 左侧视图：世界空间 (2D+3D叠加)
-│   │   ├── ModelViewer.tsx      # 右侧视图：模型空间 (CAD查看)
-│   │   ├── ClassificationPanel.tsx  # 守门人分类面板
-│   │   ├── ControlPanel.tsx     # 控制面板 (点对管理、对齐操作)
-│   │   └── index.ts
+│   │   ├── MVApp.tsx              # Multi-view main app
+│   │   ├── MVFrameView.tsx        # Multi-view frame display
+│   │   ├── MVModelViewer.tsx      # 3D model viewer (multi-view)
+│   │   ├── MVControlPanel.tsx     # Multi-view control panel
+│   │   ├── App.tsx                # Single-view main app
+│   │   ├── WorldView.tsx          # World space view (2D+3D overlay)
+│   │   ├── ModelViewer.tsx        # 3D model viewer (single-view)
+│   │   ├── ControlPanel.tsx       # Single-view control panel
+│   │   └── ClassificationPanel.tsx
 │   ├── stores/
-│   │   └── annotationStore.ts   # Zustand 状态管理
+│   │   ├── mvAnnotationStore.ts   # Multi-view state (Zustand)
+│   │   └── annotationStore.ts     # Single-view state (Zustand)
 │   ├── types/
-│   │   └── index.ts             # TypeScript 类型定义
+│   │   ├── multiview.ts           # Multi-view type definitions
+│   │   └── index.ts               # Common type definitions
 │   ├── utils/
-│   │   └── math.ts              # 数学工具 (Umeyama、反投影等)
-│   ├── main.tsx
-│   └── index.css
-├── package.json
-└── README.md
+│   │   └── math.ts                # Math utilities (Umeyama, projection, etc.)
+│   ├── main-mv.tsx                # Multi-view entry point
+│   └── main.tsx                   # Single-view entry point
+├── server/
+│   ├── data_server_mv.py          # Multi-view data API server
+│   ├── data_server.py             # Single-view data API server
+│   └── mesh_decoder_service.py    # Mesh decoding service
+├── index-mv.html                  # Multi-view HTML entry
+├── index.html                     # Single-view HTML entry
+├── vite.config.ts                 # Vite configuration with proxy
+└── package.json
 ```
 
-## 核心功能
+## Data Paths (Backend Configuration)
 
-### 1. 守门人分类流程 (Gatekeeper Workflow)
+The backend server (`data_server_mv.py`) expects data in the following structure:
 
-在标点操作前强制分类：
-- **Valid (有效)**: 解锁标注功能
-- **Fixed (固定装)**: 自动保存跳过
-- **Invalid (无效)**: 直接跳过
+```python
+# Multi-view reconstruction meshes
+MV_RECON_ROOT = "/root/csz/yingbo/MV-SAM3D/reconstruction_lasa1m"
+# Structure: {MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb
 
-### 2. 双屏交互
+# LASA1M dataset (images, depth, camera params)
+LASA1M_ROOT = "/root/csz/data_partcrafter/LASA1M"
+# Structure: {LASA1M_ROOT}/{scene_id}/{object_id}/
+#   ├── info.json          # Camera intrinsics & extrinsics
+#   ├── raw_jpg/           # RGB images
+#   ├── mask/              # Point cloud projected masks
+#   └── gt/{timestamp}/    # Ground truth depth maps
 
-| 视图 | 内容 | 坐标系 | 交互 |
-|------|------|--------|------|
-| **左侧 (世界空间)** | RGB图像 + 幽灵线框 | World Space | 点击获取世界坐标 |
-| **右侧 (模型空间)** | CAD模型 | Model Space (原点) | 点击获取局部坐标 |
-
-### 3. 坐标系约定
-
-基于 `COORDINATE_SYSTEM_SUMMARY.md`:
-
-- **相机坐标系**: OpenCV标准 (+X右, +Y下, +Z前)
-- **世界坐标系**: Z-up
-- **RT矩阵**: camera-to-world (`P_world = R @ P_cam + t`)
-
-### 4. 反投影公式
-
-```typescript
-// 像素坐标 → 相机坐标
-x_cam = (u - cx) * depth / fx
-y_cam = (v - cy) * depth / fy
-z_cam = depth
-
-// 相机坐标 → 世界坐标 (RT是camera-to-world)
-P_world = R @ P_cam + t
+# Alignment results output
+MV_ALIGNED_ROOT = "/root/csz/data_partcrafter/LASA1M_ALIGNED_MV"
+# Structure: {MV_ALIGNED_ROOT}/{scene_id}/{object_id}/
+#   ├── world_pose.npy     # 4x4 model-to-world transform
+#   ├── scale.txt          # Scale factor
+#   └── result.json        # Metadata (category, error, point_pairs)
 ```
 
-### 5. Umeyama 算法
+## Data Loading Flow
 
-求解带尺度的刚体变换: `s * R * P_local + t ≈ P_world`
+### Multi-View Workflow
+
+1. **Object List Loading** (`/api/mv_objects`)
+   - Scans `MV_RECON_ROOT` for available objects with mesh.glb
+   - Checks alignment status from `MV_ALIGNED_ROOT`
+   - Returns paginated list with category status
+
+2. **Object Data Loading** (`/api/mv_object_data`)
+   - Loads mesh URL from `MV_RECON_ROOT`
+   - Samples N frames uniformly from `LASA1M_ROOT/raw_jpg/`
+   - Loads camera intrinsics/extrinsics from `info.json`
+   - Provides depth map URLs and mask URLs
+
+3. **Pose Saving** (`/api/save_mv_pose`)
+   - Saves `world_pose.npy` (4x4 matrix)
+   - Saves `scale.txt` (scale factor)
+   - Saves `result.json` (metadata)
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/mv_objects` | GET | List all objects with pagination |
+| `/api/mv_object_data` | GET | Get object data (mesh, frames, cameras) |
+| `/api/save_mv_pose` | POST | Save annotated pose |
+| `/api/refresh_cache` | GET | Refresh object list cache |
+| `/data/mv_mesh/{scene}/{obj}/mesh.glb` | GET | Serve mesh file |
+| `/data/lasa1m/{scene}/{obj}/...` | GET | Serve LASA1M data files |
+
+## Alignment Algorithm
+
+### Umeyama Algorithm
+
+Solves for similarity transform: `s * R * P_local + t ≈ P_world`
 
 ```typescript
 import { solveUmeyama } from './utils/math';
 
 const result = solveUmeyama(srcPoints, dstPoints);
-// result = { rotation, translation, scale, transformMatrix, error }
+// Returns: { rotation, translation, scale, transformMatrix, error }
 ```
 
-## 输入数据格式
+### RANSAC + Umeyama
+
+For robust alignment with outlier rejection:
 
 ```typescript
-interface AnnotationInput {
-  objectId: string;
-  rgbImage: string;              // 图像 URL
-  depthMap: Float32Array;        // 深度图 (与RGB对齐)
-  depthWidth: number;
-  depthHeight: number;
-  maskImage: string;             // 分割掩码 URL
-  cadModel: string;              // 3D模型 (.glb/.obj)
-  cameraIntrinsics: CameraIntrinsics;  // 3x3 内参 K
-  cameraExtrinsics: Matrix4;     // 4x4 camera-to-world RT
-  initialCoarsePose: Matrix4;    // 4x4 Model-to-World 初始位姿
-}
+import { solveUmeyamaRANSAC } from './utils/math';
+
+const result = solveUmeyamaRANSAC(srcPoints, dstPoints, {
+  maxIterations: 100,
+  inlierThreshold: 0.05  // 5cm threshold
+});
+// Returns: { ..., inlierIndices, outlierIndices }
 ```
 
-## 输出数据格式
+## Coordinate System Convention
 
-```json
-{
-  "objectId": "...",
-  "category": "valid",
-  "worldPose": [/* 16位数组 Model-to-World */],
-  "scale": 1.05,
-  "points": [/* 点对列表 */],
-  "timestamp": 1234567890
-}
+- **Camera Coordinate**: OpenCV standard (+X right, +Y down, +Z forward)
+- **World Coordinate**: Z-up
+- **RT Matrix**: camera-to-world (`P_world = R @ P_cam + t`)
+
+### Unprojection Formula
+
+```
+x_cam = (u - cx) * depth / fx
+y_cam = (v - cy) * depth / fy
+z_cam = depth
+P_world = RT @ [x_cam, y_cam, z_cam, 1]
 ```
 
-## 使用方法
-
-### 开发模式
-
-```bash
-cd pose-annotation-tool
-npm install
-npm run dev
-```
-
-### 构建
-
-```bash
-npm run build
-```
-
-### 集成使用
-
-```tsx
-import { PoseAnnotationTool } from './components';
-
-<PoseAnnotationTool
-  input={annotationInput}
-  onSave={(result) => console.log('保存:', result)}
-  onSkip={(reason) => console.log('跳过:', reason)}
-/>
-```
-
-## 依赖
+## Dependencies
 
 - React 18
 - Three.js + @react-three/fiber + @react-three/drei
-- Zustand (状态管理)
-- TailwindCSS (样式)
-- Lucide React (图标)
+- Zustand (state management)
+- TailwindCSS (styling)
+- Lucide React (icons)
 
-## 关键数学函数
+## Key Math Functions
 
-| 函数 | 用途 |
-|------|------|
-| `solveUmeyama(src, dst)` | Umeyama 配准算法 |
-| `unprojectPoint(u, v, depth, K, RT)` | 像素反投影到世界坐标 |
-| `projectPoint(point, K, RT)` | 世界坐标投影到像素 |
-| `inverse4(matrix)` | 4x4 矩阵求逆 |
-| `svd3x3(matrix)` | 3x3 SVD 分解 |
-
-## 文件修改列表
-
-| 文件 | 说明 |
-|------|------|
-| `src/types/index.ts` | 类型定义 |
-| `src/utils/math.ts` | 数学工具函数 |
-| `src/stores/annotationStore.ts` | Zustand状态管理 |
-| `src/components/ModelViewer.tsx` | 模型空间视图 |
-| `src/components/WorldView.tsx` | 世界空间视图 |
-| `src/components/ClassificationPanel.tsx` | 分类面板 |
-| `src/components/ControlPanel.tsx` | 控制面板 |
-| `src/components/App.tsx` | 主应用组件 |
-| `src/main.tsx` | 入口文件 (更新) |
+| Function | Purpose |
+|----------|---------|
+| `solveUmeyama(src, dst)` | Umeyama registration |
+| `solveUmeyamaRANSAC(src, dst, opts)` | RANSAC + Umeyama |
+| `unprojectPoint(u, v, depth, K, RT)` | Pixel to world coordinate |
+| `projectPoint(point, K, RT)` | World to pixel coordinate |
+| `inverse4(matrix)` | 4x4 matrix inverse |
+| `svd3x3(matrix)` | 3x3 SVD decomposition |

@@ -598,6 +598,133 @@ export function solveUmeyama(srcPoints: Point3D[], dstPoints: Point3D[]): Umeyam
   };
 }
 
+/**
+ * RANSAC + Umeyama 算法 - 鲁棒的点集配准
+ * 
+ * 使用 RANSAC 剔除离群点，然后用内点重新计算变换
+ * 
+ * @param srcPoints 源点集 (模型空间局部坐标)
+ * @param dstPoints 目标点集 (世界空间坐标)
+ * @param options RANSAC 参数
+ * @returns 变换结果 + 内点索引
+ */
+export function solveUmeyamaRANSAC(
+  srcPoints: Point3D[],
+  dstPoints: Point3D[],
+  options: {
+    maxIterations?: number;    // 最大迭代次数
+    inlierThreshold?: number;  // 内点阈值（误差小于此值视为内点）
+    minInlierRatio?: number;   // 最小内点比例
+  } = {}
+): UmeyamaResult & { inlierIndices: number[]; outlierIndices: number[] } {
+  const n = srcPoints.length;
+  const maxIterations = options.maxIterations ?? 100;
+  const inlierThreshold = options.inlierThreshold ?? 0.05;  // 5cm 默认阈值
+  const minInlierRatio = options.minInlierRatio ?? 0.5;
+  
+  // 至少需要 3 个点
+  if (n < 3) {
+    console.error('RANSAC requires at least 3 point pairs');
+    return {
+      ...solveUmeyama(srcPoints, dstPoints),
+      inlierIndices: [],
+      outlierIndices: Array.from({ length: n }, (_, i) => i)
+    };
+  }
+  
+  // 如果点数少于 4，直接使用所有点
+  if (n <= 4) {
+    const result = solveUmeyama(srcPoints, dstPoints);
+    return {
+      ...result,
+      inlierIndices: Array.from({ length: n }, (_, i) => i),
+      outlierIndices: []
+    };
+  }
+  
+  let bestResult: UmeyamaResult | null = null;
+  let bestInliers: number[] = [];
+  let bestError = Infinity;
+  
+  // RANSAC 迭代
+  for (let iter = 0; iter < maxIterations; iter++) {
+    // 1. 随机选择 3 个点（最小样本）
+    const sampleIndices = randomSample(n, 3);
+    const sampleSrc = sampleIndices.map(i => srcPoints[i]);
+    const sampleDst = sampleIndices.map(i => dstPoints[i]);
+    
+    // 2. 用样本点计算变换
+    const candidateResult = solveUmeyama(sampleSrc, sampleDst);
+    
+    // 3. 计算所有点的误差，找内点
+    const inliers: number[] = [];
+    let totalError = 0;
+    
+    for (let i = 0; i < n; i++) {
+      const transformed = transformPoint(candidateResult.transformMatrix, srcPoints[i]);
+      const dx = transformed.x - dstPoints[i].x;
+      const dy = transformed.y - dstPoints[i].y;
+      const dz = transformed.z - dstPoints[i].z;
+      const error = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      
+      if (error < inlierThreshold) {
+        inliers.push(i);
+        totalError += error;
+      }
+    }
+    
+    // 4. 如果内点数量更多，更新最佳结果
+    if (inliers.length > bestInliers.length || 
+        (inliers.length === bestInliers.length && totalError < bestError)) {
+      bestInliers = inliers;
+      bestError = totalError;
+      bestResult = candidateResult;
+    }
+    
+    // 5. 如果内点比例足够高，提前终止
+    if (inliers.length / n >= 0.9) {
+      break;
+    }
+  }
+  
+  // 6. 用所有内点重新计算最终变换
+  if (bestInliers.length >= 3) {
+    const inlierSrc = bestInliers.map(i => srcPoints[i]);
+    const inlierDst = bestInliers.map(i => dstPoints[i]);
+    bestResult = solveUmeyama(inlierSrc, inlierDst);
+  }
+  
+  // 7. 计算离群点
+  const outlierIndices = Array.from({ length: n }, (_, i) => i)
+    .filter(i => !bestInliers.includes(i));
+  
+  console.log(`[RANSAC] 内点: ${bestInliers.length}/${n}, 离群点: ${outlierIndices.length}`);
+  
+  return {
+    ...(bestResult ?? solveUmeyama(srcPoints, dstPoints)),
+    inlierIndices: bestInliers,
+    outlierIndices
+  };
+}
+
+/**
+ * 随机采样不重复的索引
+ */
+function randomSample(n: number, k: number): number[] {
+  const indices: number[] = [];
+  const used = new Set<number>();
+  
+  while (indices.length < k) {
+    const idx = Math.floor(Math.random() * n);
+    if (!used.has(idx)) {
+      used.add(idx);
+      indices.push(idx);
+    }
+  }
+  
+  return indices;
+}
+
 // ============== 反投影函数 ==============
 
 /**

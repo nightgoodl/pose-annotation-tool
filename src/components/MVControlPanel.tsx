@@ -84,17 +84,54 @@ export function MVControlPanel() {
         </div>
       </div>
       
+      {/* 显示控制 - 移到上方便于快速访问 */}
+      <div className="bg-gray-700 rounded p-3">
+        <div className="text-sm text-gray-300 mb-2">显示设置</div>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <span className="w-16">Mask</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.1"
+              value={maskOpacity}
+              onChange={(e) => setMaskOpacity(parseFloat(e.target.value))}
+              className="flex-1"
+            />
+            <span className="w-8 text-right">{(maskOpacity * 100).toFixed(0)}%</span>
+          </div>
+          <label className="flex items-center gap-2 text-xs text-gray-400">
+            <input
+              type="checkbox"
+              checked={showGhostWireframe}
+              onChange={(e) => setShowGhostWireframe(e.target.checked)}
+              className="rounded"
+            />
+            显示mesh投影
+          </label>
+        </div>
+      </div>
+      
       {/* 对齐计算 */}
       {workflowState === 'annotation' && (
         <div className="bg-gray-700 rounded p-3">
           <div className="text-sm text-gray-300 mb-2">对齐计算</div>
           <div className="flex gap-2 mb-2">
             <button
-              onClick={runAlignment}
+              onClick={() => runAlignment(false)}
               disabled={pointPairs.length < 3}
               className="flex-1 px-3 py-2 bg-purple-600 hover:bg-purple-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm"
             >
-              计算对齐 ({pointPairs.length}/3+)
+              普通对齐
+            </button>
+            <button
+              onClick={() => runAlignment(true)}
+              disabled={pointPairs.length < 5}
+              className="flex-1 px-3 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded text-sm"
+              title="RANSAC需要至少5个点"
+            >
+              RANSAC
             </button>
             <button
               onClick={resetAlignment}
@@ -102,6 +139,9 @@ export function MVControlPanel() {
             >
               重置
             </button>
+          </div>
+          <div className="text-xs text-gray-500 mb-2">
+            点数: {pointPairs.length} (普通≥3, RANSAC≥5)
           </div>
           
           {alignmentError > 0 && (
@@ -183,34 +223,6 @@ export function MVControlPanel() {
           )}
         </div>
       )}
-      
-      {/* 显示控制 */}
-      <div className="bg-gray-700 rounded p-3">
-        <div className="text-sm text-gray-300 mb-2">显示设置</div>
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-xs text-gray-400">
-            <input
-              type="checkbox"
-              checked={showGhostWireframe}
-              onChange={(e) => setShowGhostWireframe(e.target.checked)}
-              className="rounded"
-            />
-            显示mesh投影
-          </label>
-          <div className="flex items-center gap-2 text-xs text-gray-400">
-            <span>Mask透明度</span>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.1"
-              value={maskOpacity}
-              onChange={(e) => setMaskOpacity(parseFloat(e.target.value))}
-              className="flex-1"
-            />
-          </div>
-        </div>
-      </div>
       
       {/* 保存按钮 */}
       {workflowState === 'annotation' && pointPairs.length >= 3 && (

@@ -339,14 +339,22 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         if not rgb_files:
             raise FileNotFoundError(f"No RGB files found in {rgb_dir}")
         
-        # 4. 均匀采样帧
+        # 4. 两阶段帧选择：先均匀采样12帧，再按mask比例选择num_frames帧
         total_frames = len(rgb_files)
-        if num_frames >= total_frames:
+        SAMPLE_POOL_SIZE = 12  # 均匀采样的候选池大小
+        
+        if total_frames <= num_frames:
+            # 帧数不足，全部使用
+            selected_indices = list(range(total_frames))
+        elif total_frames <= SAMPLE_POOL_SIZE:
+            # 帧数少于候选池大小，全部作为候选
             selected_indices = list(range(total_frames))
         else:
-            # 均匀采样
-            step = total_frames / num_frames
-            selected_indices = [int(i * step) for i in range(num_frames)]
+            # 均匀采样12帧作为候选池
+            step = total_frames / SAMPLE_POOL_SIZE
+            selected_indices = [int(i * step) for i in range(SAMPLE_POOL_SIZE)]
+        
+        print(f"[load_mv_object_data] Sampled {len(selected_indices)} candidate frames from {total_frames} total")
         
         # 5. 构建帧数据
         frames = []
@@ -399,11 +407,23 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                     [K[2][0], K[2][1], K[2][2]]
                 ]
             
-            # 检查mask
-            mask_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/sam_mask_sam2/{frame_id}.png"
-            if not os.path.exists(mask_path):
-                mask_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/mask/{frame_id}.png"
-            mask_subdir = 'sam_mask_sam2' if 'sam_mask_sam2' in mask_path else 'mask'
+            # 检查mask - 直接使用点云直投的mask文件夹
+            mask_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/mask/{frame_id}.png"
+            mask_subdir = 'mask'
+            
+            # 计算mask比例 (mask像素数 / 总像素数)
+            mask_ratio = 0.0
+            if os.path.exists(mask_path):
+                try:
+                    with Image.open(mask_path) as mask_img:
+                        mask_array = np.array(mask_img)
+                        if len(mask_array.shape) == 3:
+                            mask_array = mask_array[:, :, 0]  # 取第一通道
+                        mask_pixels = np.sum(mask_array > 128)  # 非零像素
+                        total_pixels = mask_array.shape[0] * mask_array.shape[1]
+                        mask_ratio = mask_pixels / total_pixels if total_pixels > 0 else 0.0
+                except Exception as e:
+                    print(f"[load_mv_object_data] Error calculating mask ratio: {e}")
             
             # 检查深度图
             depth_url = None
@@ -422,6 +442,7 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'rgb_url': f"/data/image/{scene_id}/{object_id}/raw_jpg/{frame_id}.jpg",
                 'mask_url': f"/data/image/{scene_id}/{object_id}/{mask_subdir}/{frame_id}.png" if os.path.exists(mask_path) else None,
                 'depth_url': depth_url,
+                'mask_ratio': mask_ratio,  # mask占比，用于排序
                 'camera_intrinsics': {
                     'K': K_scaled,
                     'K_original': K,
@@ -431,7 +452,22 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'camera_extrinsics': RT  # camera-to-world
             })
         
-        # 6. 加载已有的world_pose
+        # 6. 按mask比例降序排序，选择mask最大的num_frames帧
+        frames.sort(key=lambda f: f.get('mask_ratio', 0), reverse=True)
+        
+        # 从候选池中选择mask最大的num_frames帧
+        if len(frames) > num_frames:
+            frames = frames[:num_frames]
+            print(f"[load_mv_object_data] Selected top {num_frames} frames by mask_ratio from {SAMPLE_POOL_SIZE} candidates")
+        
+        # 更新frame_index为排序后的索引
+        for i, frame in enumerate(frames):
+            frame['frame_index'] = i
+        
+        mask_ratios = [round(f.get('mask_ratio', 0), 3) for f in frames]
+        print(f"[load_mv_object_data] Final {len(frames)} frames, mask_ratios: {mask_ratios}")
+        
+        # 7. 加载已有的world_pose
         world_pose = None
         aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/world_pose.npy"
         if os.path.exists(aligned_path):

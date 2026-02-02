@@ -14,7 +14,7 @@ import type {
   MVPointPair, 
   FrameData 
 } from '../types/multiview';
-import { solveUmeyama, identity4 } from '../utils/math';
+import { solveUmeyama, solveUmeyamaRANSAC, identity4 } from '../utils/math';
 
 interface MVAnnotationStore {
   // ========== 输入数据 ==========
@@ -65,7 +65,7 @@ interface MVAnnotationStore {
   frameIoUs: Map<string, number>; // 每帧的IoU
   averageIoU: number;
   setFrameIoU: (frameId: string, iou: number) => void;
-  runAlignment: () => void;
+  runAlignment: (useRANSAC?: boolean) => void;
   resetAlignment: () => void;
   
   // ========== UI 状态 ==========
@@ -236,7 +236,7 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     });
   },
   
-  runAlignment: () => {
+  runAlignment: (useRANSAC: boolean = false) => {
     const state = get();
     if (state.pointPairs.length < 3) {
       console.warn('需要至少3对点才能运行对齐');
@@ -247,22 +247,46 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     const srcPoints = state.pointPairs.map(p => p.localPoint);
     const dstPoints = state.pointPairs.map(p => p.worldPoint);
     
-    const result = solveUmeyama(srcPoints, dstPoints);
-    
-    set({
-      calculatedPose: result.transformMatrix,
-      calculatedScale: result.scale,
-      alignmentError: result.error
-    });
-    
-    console.log('MV Alignment result:', {
-      numPoints: state.pointPairs.length,
-      numFrames: new Set(state.pointPairs.map(p => p.frame_id)).size,
-      scale: result.scale,
-      error: result.error,
-      rotation: result.rotation,
-      translation: result.translation
-    });
+    if (useRANSAC && state.pointPairs.length >= 5) {
+      // 使用 RANSAC 进行鲁棒对齐
+      const result = solveUmeyamaRANSAC(srcPoints, dstPoints, {
+        maxIterations: 100,
+        inlierThreshold: 0.05  // 5cm 阈值
+      });
+      
+      set({
+        calculatedPose: result.transformMatrix,
+        calculatedScale: result.scale,
+        alignmentError: result.error
+      });
+      
+      console.log('MV Alignment (RANSAC) result:', {
+        numPoints: state.pointPairs.length,
+        numFrames: new Set(state.pointPairs.map(p => p.frame_id)).size,
+        inliers: result.inlierIndices.length,
+        outliers: result.outlierIndices.length,
+        scale: result.scale,
+        error: result.error
+      });
+    } else {
+      // 使用普通 Umeyama
+      const result = solveUmeyama(srcPoints, dstPoints);
+      
+      set({
+        calculatedPose: result.transformMatrix,
+        calculatedScale: result.scale,
+        alignmentError: result.error
+      });
+      
+      console.log('MV Alignment result:', {
+        numPoints: state.pointPairs.length,
+        numFrames: new Set(state.pointPairs.map(p => p.frame_id)).size,
+        scale: result.scale,
+        error: result.error,
+        rotation: result.rotation,
+        translation: result.translation
+      });
+    }
   },
   
   resetAlignment: () => {

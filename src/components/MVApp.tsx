@@ -19,7 +19,7 @@ import type { Matrix4 } from '../types';
 const MV_DATA_SERVER = '';
 
 // 从服务器加载多视角物体数据
-async function loadMVObjectData(sceneId: string, objectId: string, numFrames: number = 8): Promise<MVAnnotationInput | null> {
+async function loadMVObjectData(sceneId: string, objectId: string, numFrames: number = 4): Promise<MVAnnotationInput | null> {
   try {
     const response = await fetch(
       `${MV_DATA_SERVER}/api/mv_object_data?scene_id=${sceneId}&object_id=${objectId}&num_frames=${numFrames}`
@@ -64,7 +64,7 @@ function MVDataSelector({ onSelect, savedObjectInfo }: MVDataSelectorProps) {
   const [loading, setLoading] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [numFrames, setNumFrames] = useState(8);
+  const [numFrames, setNumFrames] = useState(4);
   
   // 分页状态
   const [page, setPage] = useState(1);
@@ -295,6 +295,8 @@ export function MVPoseAnnotationTool() {
   const calculatedPose = useMVAnnotationStore((state) => state.calculatedPose);
   const reset = useMVAnnotationStore((state) => state.reset);
   const category = useMVAnnotationStore((state) => state.category);
+  const maskOpacity = useMVAnnotationStore((state) => state.maskOpacity);
+  const setMaskOpacity = useMVAnnotationStore((state) => state.setMaskOpacity);
   
   // 用于通知数据选择器更新对象状态
   const [savedObjectInfo, setSavedObjectInfo] = useState<{objectId: string; category: string} | null>(null);
@@ -338,8 +340,25 @@ export function MVPoseAnnotationTool() {
         <div className="ml-4 text-sm text-gray-400 truncate max-w-md">
           {currentInput.objectId}
         </div>
-        <div className="ml-auto text-sm text-gray-400">
-          {currentInput.frames.length} 帧
+        
+        {/* Mask透明度控制 - 放在顶部便于快速访问 */}
+        <div className="ml-auto flex items-center gap-4">
+          <div className="flex items-center gap-2 text-sm text-gray-400">
+            <span>Mask</span>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.1"
+              value={maskOpacity}
+              onChange={(e) => setMaskOpacity(parseFloat(e.target.value))}
+              className="w-24"
+            />
+            <span className="w-8">{(maskOpacity * 100).toFixed(0)}%</span>
+          </div>
+          <div className="text-sm text-gray-400">
+            {currentInput.frames.length} 帧
+          </div>
         </div>
       </header>
       
