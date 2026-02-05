@@ -3,6 +3,7 @@
  */
 
 import { useMVAnnotationStore } from '../stores/mvAnnotationStore';
+import { showGlobalToast } from '../hooks/useToast';
 
 export function MVControlPanel() {
   const workflowState = useMVAnnotationStore((state) => state.workflowState);
@@ -15,8 +16,6 @@ export function MVControlPanel() {
   const showGhostWireframe = useMVAnnotationStore((state) => state.showGhostWireframe);
   const maskOpacity = useMVAnnotationStore((state) => state.maskOpacity);
   
-  const classifyAsValid = useMVAnnotationStore((state) => state.classifyAsValid);
-  const classifyAsInvalid = useMVAnnotationStore((state) => state.classifyAsInvalid);
   const removePointPair = useMVAnnotationStore((state) => state.removePointPair);
   const clearPointPairs = useMVAnnotationStore((state) => state.clearPointPairs);
   const runAlignment = useMVAnnotationStore((state) => state.runAlignment);
@@ -34,9 +33,9 @@ export function MVControlPanel() {
   const handleSave = async () => {
     const result = await savePose();
     if (result.success) {
-      alert(`保存成功！\n路径: ${result.pose_path}`);
+      showGlobalToast('保存成功', 'success', 1500);
     } else {
-      alert(`保存失败: ${result.error}`);
+      showGlobalToast(`保存失败: ${result.error}`, 'error', 3000);
     }
   };
   
@@ -46,27 +45,6 @@ export function MVControlPanel() {
       <div className="text-white font-semibold border-b border-gray-600 pb-2">
         多视角对齐控制
       </div>
-      
-      {/* 分类面板 */}
-      {workflowState === 'classification' && (
-        <div className="bg-gray-700 rounded p-3">
-          <div className="text-sm text-gray-300 mb-2">物体分类</div>
-          <div className="flex flex-col gap-2">
-            <button
-              onClick={classifyAsValid}
-              className="px-3 py-2 bg-green-600 hover:bg-green-500 text-white rounded text-sm"
-            >
-              ✓ 开始标注
-            </button>
-            <button
-              onClick={classifyAsInvalid}
-              className="px-3 py-2 bg-red-600 hover:bg-red-500 text-white rounded text-sm"
-            >
-              ✗ 无效数据
-            </button>
-          </div>
-        </div>
-      )}
       
       {/* 状态信息 */}
       <div className="bg-gray-700 rounded p-3">

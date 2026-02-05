@@ -473,6 +473,24 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         if os.path.exists(aligned_path):
             world_pose = np.load(aligned_path).tolist()
         
+        # 8. 读取GT bbox（从instances.json）
+        gt_bbox = None
+        instances_path = f"{LASA1M_ROOT}/{scene_id}/instances.json"
+        if os.path.exists(instances_path):
+            try:
+                with open(instances_path, 'r') as f:
+                    instances = json.load(f)
+                for inst in instances:
+                    if inst.get('id') == object_id:
+                        gt_bbox = {
+                            'position': inst.get('position'),   # 中心点（世界坐标）
+                            'scale': inst.get('scale'),         # 半轴长度（局部坐标系）
+                            'R': inst.get('R')                  # 旋转矩阵 (可选)
+                        }
+                        break
+            except Exception as e:
+                print(f"[load_mv_object_data] 警告: 加载instances.json失败: {e}")
+        
         return {
             'scene_id': scene_id,
             'object_id': object_id,
@@ -480,7 +498,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'mesh_path': mesh_path,
             'world_pose': world_pose,
             'frames': frames,
-            'total_frames': total_frames
+            'total_frames': total_frames,
+            'gt_bbox': gt_bbox
         }
     
     def serve_data_file(self, path):
@@ -574,11 +593,23 @@ def warmup_cache():
             aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
             has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
             
+            # 读取分类状态
+            category = None
+            result_path = f"{aligned_path}/result.json"
+            if os.path.exists(result_path):
+                try:
+                    with open(result_path, 'r') as f:
+                        result_data = json.load(f)
+                        category = result_data.get('category')
+                except:
+                    pass
+            
             mv_objects.append({
                 'scene_id': scene_id,
                 'object_id': object_id,
                 'num_frames': -1,
-                'has_alignment': has_alignment
+                'has_alignment': has_alignment,
+                'category': category
             })
     
     mv_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))

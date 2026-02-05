@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useMVAnnotationStore } from '../stores/mvAnnotationStore';
 import { unprojectPoint } from '../utils/math';
+import { showGlobalToast } from '../hooks/useToast';
 import type { Matrix4, CameraIntrinsics } from '../types';
 import type { FrameData, MVPointPair } from '../types/multiview';
 
@@ -502,11 +503,11 @@ export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverU
     console.log('[MVFrameView] 图像点击事件触发', { isEnabled, isActive, hasDepth: !!frame.depthMap });
     
     if (!isEnabled) {
-      alert('请先点击右侧"需要对齐"按钮启用标注');
+      showGlobalToast('请先点击右侧“需要对齐”按钮启用标注', 'warning', 1500);
       return;
     }
     if (!isActive) {
-      alert('请先点击选中此帧（点击帧的标题栏）');
+      showGlobalToast('请先点击选中此帧', 'warning', 1500);
       return;
     }
     
@@ -529,34 +530,8 @@ export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverU
     
     // 获取深度
     if (!frame.depthMap) {
-      console.warn('[MVFrameView] 深度图未加载，尝试使用默认深度');
-      // 使用默认深度值继续（允许用户在深度图加载前标注）
-      const defaultDepth = 1.5; // 默认1.5米
-      
-      const K = frame.camera_intrinsics.K;
-      if (!K) {
-        alert('相机参数缺失，无法标注');
-        return;
-      }
-      
-      const intrinsics: CameraIntrinsics = {
-        fx: K[0][0],
-        fy: K[1][1],
-        cx: K[0][2],
-        cy: K[1][2],
-        width: frame.camera_intrinsics.width,
-        height: frame.camera_intrinsics.height
-      };
-      
-      const worldPoint = unprojectPoint(u, v, defaultDepth, intrinsics, frame.camera_extrinsics);
-      console.log(`[MVFrameView] 使用默认深度 ${defaultDepth}m, world=`, worldPoint);
-      
-      setPendingWorldPoint({
-        point: worldPoint,
-        pixel: { u, v },
-        depth: defaultDepth,
-        frameId: frame.frame_id
-      });
+      console.warn('[MVFrameView] 深度图未加载');
+      showGlobalToast('深度图加载中，请稍候', 'warning', 1500);
       return;
     }
     
@@ -574,7 +549,7 @@ export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverU
     // 如果深度无效，直接提示用户
     if (depth === null) {
       console.warn('Invalid depth at pixel:', u, v);
-      alert('该位置没有有效深度值，请选择其他位置');
+      showGlobalToast('该位置无有效深度，请选择其他位置', 'warning', 1500);
       return;
     }
     

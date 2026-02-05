@@ -12,7 +12,9 @@ import { useMVAnnotationStore } from '../stores/mvAnnotationStore';
 import { MVFrameView } from './MVFrameView';
 import { MVModelViewer } from './MVModelViewer';
 import { MVControlPanel } from './MVControlPanel';
-import type { MVAnnotationInput, MVObjectItem, MVObjectData } from '../types/multiview';
+import { ToastContainer } from './ToastContainer';
+import { showGlobalToast } from '../hooks/useToast';
+import type { MVAnnotationInput, MVObjectItem, MVObjectData, BboxInfo } from '../types/multiview';
 import type { Matrix4 } from '../types';
 
 // 数据服务器地址 - 使用相对路径，通过Vite代理转发
@@ -35,7 +37,8 @@ async function loadMVObjectData(sceneId: string, objectId: string, numFrames: nu
       objectId: `${data.scene_id}_${data.object_id}`,
       meshUrl: data.mesh_url,
       frames: data.frames,
-      initialPose: data.world_pose as Matrix4 | null
+      initialPose: data.world_pose as Matrix4 | null,
+      gtBbox: data.gt_bbox as BboxInfo | null
     };
   } catch (e) {
     console.error('Failed to load MV object data:', e);
@@ -359,6 +362,15 @@ export function MVPoseAnnotationTool() {
           <div className="text-sm text-gray-400">
             {currentInput.frames.length} 帧
           </div>
+          <button
+            onClick={() => {
+              useMVAnnotationStore.getState().classifyAsInvalid();
+              showGlobalToast('已标记为无效数据', 'warning', 1500);
+            }}
+            className="px-3 py-1 bg-red-600 hover:bg-red-500 text-white rounded text-sm"
+          >
+            ✗ 无效数据
+          </button>
         </div>
       </header>
       
@@ -414,6 +426,9 @@ export function MVPoseAnnotationTool() {
           </div>
         </div>
       </div>
+      
+      {/* Toast 容器 */}
+      <ToastContainer />
     </div>
   );
 }

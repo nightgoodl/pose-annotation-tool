@@ -97,8 +97,8 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     set({ 
       currentInput: input,
       activeFrameId: input?.frames[0]?.frame_id ?? null,
-      workflowState: 'classification',
-      category: 'unclassified',
+      workflowState: 'annotation',
+      category: 'valid',
       pointPairs: [],
       selectedPairId: null,
       pendingLocalPoint: null,
@@ -108,7 +108,7 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       alignmentError: 0,
       frameIoUs: new Map(),
       averageIoU: 0,
-      isAnnotationEnabled: false
+      isAnnotationEnabled: true
     });
   },
   

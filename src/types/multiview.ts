@@ -4,6 +4,13 @@
 
 import type { Matrix4, Point3D, PixelCoord } from './index';
 
+// GT Bbox 信息
+export interface BboxInfo {
+  position: [number, number, number];  // 中心点（世界坐标）
+  scale: [number, number, number];     // 半轴长度
+  R?: number[][];                      // 旋转矩阵
+}
+
 // 单帧数据
 export interface FrameData {
   frame_id: string;
@@ -33,6 +40,7 @@ export interface MVObjectData {
   world_pose: Matrix4 | null;
   frames: FrameData[];
   total_frames: number;
+  gt_bbox: BboxInfo | null;
 }
 
 // 多视角点对匹配 (包含帧信息)
@@ -60,6 +68,7 @@ export interface MVAnnotationInput {
   meshUrl: string;            // mesh文件URL
   frames: FrameData[];        // 多帧数据
   initialPose: Matrix4 | null;  // 初始pose
+  gtBbox: BboxInfo | null;    // GT bbox信息
 }
 
 // 多视角标注输出结果
