@@ -75,6 +75,12 @@ interface AnnotationStore {
   exportAnnotation: () => AnnotationOutput | null;
   savePose: () => Promise<{ success: boolean; pose_path?: string; error?: string }>;
   
+  // ========== 保存并处理下一个 ==========
+  isSavingNext: boolean;
+  remainingCount: number | null;
+  setIsSavingNext: (val: boolean) => void;
+  setRemainingCount: (count: number | null) => void;
+  
   // ========== 重置 ==========
   reset: () => void;
 }
@@ -350,6 +356,12 @@ export const useAnnotationStore = create<AnnotationStore>((set, get) => ({
     }
   },
   
+  // ========== 保存并处理下一个 ==========
+  isSavingNext: false,
+  remainingCount: null,
+  setIsSavingNext: (val) => set({ isSavingNext: val }),
+  setRemainingCount: (count) => set({ remainingCount: count }),
+  
   // ========== 重置 ==========
   reset: () => {
     set({
@@ -367,7 +379,9 @@ export const useAnnotationStore = create<AnnotationStore>((set, get) => ({
       isLeftViewEnabled: false,
       isRightViewEnabled: false,
       showGhostWireframe: true,
-      maskOpacity: 0.5
+      maskOpacity: 0.5,
+      isSavingNext: false,
+      remainingCount: null
     });
   }
 }));

@@ -14,6 +14,7 @@ import { WorldView } from './WorldView';
 import { ModelViewer } from './ModelViewer';
 import { ClassificationPanel } from './ClassificationPanel';
 import { ControlPanel } from './ControlPanel';
+import { showGlobalToast } from '../hooks/useToast';
 import type { AnnotationInput, Matrix4 } from '../types';
 
 // 数据服务器地址 - 使用base路径以支持tunnel
@@ -28,6 +29,31 @@ interface AlignedObject {
   object_id: string;
   frame_id: string;
   iou: number | null;
+}
+
+// 下一个任务的类型
+interface NextTaskResponse {
+  success: boolean;
+  has_next: boolean;
+  data: {
+    scene_id: string;
+    object_id: string;
+    frame_id: string;
+    iou: number | null;
+  } | null;
+  remaining_count: number;
+  message?: string;
+}
+
+// 获取下一个待标注任务
+async function fetchNextTask(currentSceneId?: string, excludeObjectId?: string, excludeFrameId?: string): Promise<NextTaskResponse> {
+  const params = new URLSearchParams();
+  if (currentSceneId) params.set('current_scene_id', currentSceneId);
+  if (excludeObjectId) params.set('exclude_object_id', excludeObjectId);
+  if (excludeFrameId) params.set('exclude_frame_id', excludeFrameId);
+  
+  const response = await fetch(`${DATA_SERVER}/api/next_task?${params.toString()}`);
+  return await response.json();
 }
 
 // 从服务器加载数据
@@ -270,6 +296,7 @@ export function PoseAnnotationTool({ input, onSave, onSkip }: PoseAnnotationTool
   const currentInput = useAnnotationStore((state) => state.currentInput);
   const workflowState = useAnnotationStore((state) => state.workflowState);
   const category = useAnnotationStore((state) => state.category);
+  const isSavingNext = useAnnotationStore((state) => state.isSavingNext);
   const reset = useAnnotationStore((state) => state.reset);
   
   // 初始化输入数据
@@ -298,6 +325,100 @@ export function PoseAnnotationTool({ input, onSave, onSkip }: PoseAnnotationTool
   const handleBack = useCallback(() => {
     reset();
   }, [reset]);
+  
+  // 保存并处理下一个
+  const handleSaveAndNext = useCallback(async () => {
+    const store = useAnnotationStore.getState();
+    if (store.isSavingNext || !store.currentInput) return;
+    
+    store.setIsSavingNext(true);
+    
+    try {
+      // 步骤1：保存当前标注
+      const saveResult = await store.savePose();
+      if (!saveResult.success) {
+        showGlobalToast(`保存失败: ${saveResult.error}`, 'error', 4000);
+        store.setIsSavingNext(false);
+        return;
+      }
+      showGlobalToast('已保存当前标注', 'success', 2000);
+      
+      // 解析当前objectId获取scene_id, object_id, frame_id
+      const parts = store.currentInput!.objectId.split('_');
+      const currentSceneId = parts[0];
+      const currentFrameId = parts[parts.length - 1];
+      const currentObjectId = parts.slice(1, -1).join('_');
+      
+      // 步骤2：获取下一个待标注任务
+      const nextTaskResponse = await fetchNextTask(currentSceneId, currentObjectId, currentFrameId);
+      
+      if (!nextTaskResponse.success || !nextTaskResponse.has_next || !nextTaskResponse.data) {
+        showGlobalToast('所有物体已标注完成！', 'info', 5000);
+        store.setIsSavingNext(false);
+        reset();
+        return;
+      }
+      
+      store.setRemainingCount(nextTaskResponse.remaining_count - 1);
+      
+      // 步骤3：加载下一个任务的数据
+      const nextData = nextTaskResponse.data;
+      const objectData = await loadObjectData(
+        nextData.scene_id,
+        nextData.object_id,
+        nextData.frame_id
+      );
+      
+      if (!objectData) {
+        showGlobalToast('加载下一个物体数据失败', 'error', 4000);
+        store.setIsSavingNext(false);
+        return;
+      }
+      
+      // 步骤4：切换到新的标注对象
+      setCurrentInput(objectData);
+      showGlobalToast(
+        `已切换到下一个物体 (剩余 ${nextTaskResponse.remaining_count - 1} 个)`,
+        'success',
+        3000
+      );
+      
+    } catch (error) {
+      console.error('[handleSaveAndNext] error:', error);
+      showGlobalToast(`操作失败: ${error}`, 'error', 4000);
+    } finally {
+      useAnnotationStore.getState().setIsSavingNext(false);
+    }
+  }, [reset, setCurrentInput]);
+  
+  // 快捷键支持
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ctrl+S / Cmd+S: 保存
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault();
+        const store = useAnnotationStore.getState();
+        if (store.workflowState === 'annotation') {
+          store.savePose().then(result => {
+            if (result.success) {
+              showGlobalToast(`Pose已保存到: ${result.pose_path}`, 'success', 3000);
+            } else {
+              showGlobalToast(`保存失败: ${result.error}`, 'error', 4000);
+            }
+          });
+        }
+      }
+      
+      // Ctrl+Enter / Cmd+Enter: 保存并处理下一个
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        handleSaveAndNext();
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleSaveAndNext]);
   
   // 没有数据时显示数据选择器
   if (!currentInput) {
@@ -354,12 +475,25 @@ export function PoseAnnotationTool({ input, onSave, onSkip }: PoseAnnotationTool
         
         {/* 右侧边栏：控制面板 */}
         <div className="w-72 p-2">
-          <ControlPanel />
+          <ControlPanel onSaveAndNext={handleSaveAndNext} />
         </div>
       </div>
       
       {/* 分类弹出层 */}
       <ClassificationPanel />
+      
+      {/* 保存并处理下一个的加载遮罩 */}
+      {isSavingNext && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-[9998]">
+          <div className="bg-gray-800 rounded-xl px-8 py-6 text-center shadow-2xl border border-gray-700">
+            <div className="w-12 h-12 border-4 border-gray-600 border-t-blue-500 rounded-full animate-spin mx-auto mb-4" />
+            <div className="space-y-2">
+              <div className="text-green-400 text-sm">✓ 已保存当前标注</div>
+              <div className="text-white text-sm font-semibold">正在加载下一个物体...</div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -39,6 +39,11 @@ class DataAPIHandler(SimpleHTTPRequestHandler):
             self.handle_list_objects(scene_id)
         elif path == '/api/aligned_objects':
             self.handle_list_aligned_objects()
+        elif path == '/api/next_task':
+            current_scene_id = query.get('current_scene_id', [None])[0]
+            exclude_object_id = query.get('exclude_object_id', [None])[0]
+            exclude_frame_id = query.get('exclude_frame_id', [None])[0]
+            self.handle_next_task(current_scene_id, exclude_object_id, exclude_frame_id)
         elif path == '/api/object_data':
             scene_id = query.get('scene_id', [None])[0]
             object_id = query.get('object_id', [None])[0]
@@ -235,6 +240,98 @@ class DataAPIHandler(SimpleHTTPRequestHandler):
         # 按IOU降序排列
         aligned_objects.sort(key=lambda x: x.get('iou') or 0, reverse=True)
         self.send_json({'aligned_objects': aligned_objects[:100]})  # 只返回前100个
+    
+    def handle_next_task(self, current_scene_id, exclude_object_id, exclude_frame_id):
+        """
+        获取下一个待标注的物体（尚未手动标注过的）。
+        优先返回同场景的物体，其次返回其他场景的物体。
+        
+        "待标注"定义：在 ALIGNED_ROOT 中有 world_pose 但在 LASA1M_ALIGNED_Manual 中没有对应 pose 文件的物体。
+        """
+        MANUAL_ROOT = "/root/csz/data_partcrafter/LASA1M_ALIGNED_Manual"
+        
+        # 收集所有已对齐但尚未手动标注的物体
+        pending_objects = []
+        
+        for scene_dir in sorted(glob.glob(f"{ALIGNED_ROOT}/*")):
+            if not os.path.isdir(scene_dir):
+                continue
+            scene_id = os.path.basename(scene_dir)
+            
+            for obj_dir in sorted(glob.glob(f"{scene_dir}/*")):
+                if not os.path.isdir(obj_dir):
+                    continue
+                object_id = os.path.basename(obj_dir)
+                
+                # 查找world_pose文件
+                world_pose_files = glob.glob(f"{obj_dir}/world_pose_*.npy")
+                for wp_file in world_pose_files:
+                    frame_id = os.path.basename(wp_file).replace('world_pose_', '').replace('.npy', '')
+                    
+                    # 排除当前正在标注的物体
+                    if (scene_id == current_scene_id and 
+                        object_id == exclude_object_id and 
+                        frame_id == exclude_frame_id):
+                        continue
+                    
+                    # 检查是否已手动标注过
+                    manual_pose_path = f"{MANUAL_ROOT}/{scene_id}/{object_id}/world_pose_{frame_id}.npy"
+                    if os.path.exists(manual_pose_path):
+                        continue  # 已标注，跳过
+                    
+                    # 读取IOU
+                    result_file = f"{obj_dir}/result_{frame_id}.json"
+                    iou = None
+                    if os.path.exists(result_file):
+                        try:
+                            with open(result_file) as f:
+                                result = json.load(f)
+                                iou = result.get('iou')
+                        except Exception:
+                            pass
+                    
+                    pending_objects.append({
+                        'scene_id': scene_id,
+                        'object_id': object_id,
+                        'frame_id': frame_id,
+                        'iou': iou,
+                        'is_same_scene': scene_id == current_scene_id
+                    })
+        
+        if not pending_objects:
+            self.send_json({
+                'success': True,
+                'has_next': False,
+                'data': None,
+                'remaining_count': 0,
+                'message': 'No more tasks available'
+            })
+            return
+        
+        # 排序：优先同场景，然后按IOU升序（IOU低的更需要标注）
+        pending_objects.sort(key=lambda x: (
+            0 if x['is_same_scene'] else 1,  # 同场景优先
+            x.get('iou') or 0  # IOU低的优先
+        ))
+        
+        next_task = pending_objects[0]
+        remaining_count = len(pending_objects)
+        
+        print(f"[next_task] 下一个任务: scene={next_task['scene_id']}, "
+              f"object={next_task['object_id']}, frame={next_task['frame_id']}, "
+              f"iou={next_task.get('iou')}, remaining={remaining_count}")
+        
+        self.send_json({
+            'success': True,
+            'has_next': True,
+            'data': {
+                'scene_id': next_task['scene_id'],
+                'object_id': next_task['object_id'],
+                'frame_id': next_task['frame_id'],
+                'iou': next_task.get('iou'),
+            },
+            'remaining_count': remaining_count
+        })
     
     def handle_get_object_data(self, scene_id, object_id, frame_id):
         """获取物体的完整数据"""

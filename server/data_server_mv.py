@@ -67,11 +67,18 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 _mv_objects_cache_time = 0
                 self.send_json({'success': True, 'message': 'Cache refreshed'})
         
+        elif path == '/api/next_mv_task':
+            current_scene_id = query.get('current_scene_id', [None])[0]
+            exclude_object_id = query.get('exclude_object_id', [None])[0]
+            self.handle_next_mv_task(current_scene_id, exclude_object_id)
         elif path == '/api/mv_objects':
             page = int(query.get('page', [1])[0])
             page_size = int(query.get('page_size', [50])[0])
             scene_filter = query.get('scene', [None])[0]
-            self.handle_list_mv_objects(page, page_size, scene_filter)
+            sort_by = query.get('sort_by', [None])[0]
+            sort_order = query.get('sort_order', ['desc'])[0]
+            status_filter = query.get('status', [None])[0]
+            self.handle_list_mv_objects(page, page_size, scene_filter, sort_by, sort_order, status_filter)
         elif path == '/api/mv_object_data':
             scene_id = query.get('scene_id', [None])[0]
             object_id = query.get('object_id', [None])[0]
@@ -187,6 +194,7 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         print(f"[save_mv_pose] Pose矩阵:\n{pose_array}")
         
         # 保存结果元数据
+        average_iou = data.get('average_iou', 0.0)
         result = {
             "scene_id": scene_id,
             "object_id": object_id,
@@ -195,7 +203,9 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             "alignment_error": error,
             "source": "manual_mv_annotation",
             "num_point_pairs": len(point_pairs),
-            "category": category
+            "category": category,
+            "average_iou": average_iou,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S")
         }
         result_path = f"{save_dir}/result.json"
         with open(result_path, 'w') as f:
@@ -207,6 +217,9 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             pairs_path = f"{save_dir}/point_pairs.json"
             with open(pairs_path, 'w') as f:
                 json.dump(point_pairs, f, indent=2)
+        
+        # 立即更新缓存，避免 next_mv_task 重复返回已标注物体
+        self._update_single_object_cache(scene_id, object_id)
         
         self.send_json({
             'success': True,
@@ -261,8 +274,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             traceback.print_exc()
             self.send_json({'error': str(e)}, 500)
     
-    def handle_list_mv_objects(self, page=1, page_size=50, scene_filter=None):
-        """列出多视角重建物体（带分页和缓存）"""
+    def handle_list_mv_objects(self, page=1, page_size=50, scene_filter=None, sort_by=None, sort_order='desc', status_filter=None):
+        """列出多视角重建物体（带分页、缓存、排序和状态过滤）"""
         global _mv_objects_cache, _mv_objects_cache_time
         
         # 检查缓存是否有效
@@ -275,10 +288,34 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             print(f"[handle_list_mv_objects] 缓存构建完成，耗时 {time.time() - start_time:.2f}s，共 {len(_mv_objects_cache)} 个物体")
         
         # 应用场景过滤
+        filtered = list(_mv_objects_cache)  # copy
         if scene_filter:
-            filtered = [o for o in _mv_objects_cache if o['scene_id'] == scene_filter]
-        else:
-            filtered = _mv_objects_cache
+            filtered = [o for o in filtered if o['scene_id'] == scene_filter]
+        
+        # 应用状态过滤
+        if status_filter:
+            if status_filter == 'pending':
+                filtered = [o for o in filtered if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid')]
+            elif status_filter == 'aligned':
+                filtered = [o for o in filtered if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') != 'invalid')]
+            elif status_filter == 'invalid':
+                filtered = [o for o in filtered if o.get('category') == 'invalid']
+        
+        # 应用排序
+        reverse = (sort_order == 'desc')
+        if sort_by == 'average_iou':
+            filtered.sort(key=lambda x: x.get('average_iou', 0) or 0, reverse=reverse)
+        elif sort_by == 'num_point_pairs':
+            filtered.sort(key=lambda x: x.get('num_point_pairs', 0) or 0, reverse=reverse)
+        elif sort_by == 'saved_at':
+            filtered.sort(key=lambda x: x.get('saved_at') or '', reverse=reverse)
+        # 默认不额外排序，保持 scene_id + object_id 顺序
+        
+        # 统计各状态数量
+        all_count = len(_mv_objects_cache)
+        pending_count = sum(1 for o in _mv_objects_cache if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid'))
+        aligned_count = sum(1 for o in _mv_objects_cache if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') != 'invalid'))
+        invalid_count = sum(1 for o in _mv_objects_cache if o.get('category') == 'invalid')
         
         total = len(filtered)
         
@@ -296,7 +333,13 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'page': page,
             'page_size': page_size,
             'total_pages': (total + page_size - 1) // page_size,
-            'scenes': all_scenes[:100]  # 只返回前100个场景用于筛选
+            'scenes': all_scenes[:100],
+            'stats': {
+                'all': all_count,
+                'pending': pending_count,
+                'aligned': aligned_count,
+                'invalid': invalid_count
+            }
         })
     
     def _update_single_object_cache(self, scene_id, object_id):
@@ -310,12 +353,18 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
         
         category = None
+        num_point_pairs = 0
+        average_iou = 0.0
+        saved_at = None
         result_path = f"{aligned_path}/result.json"
         if os.path.exists(result_path):
             try:
                 with open(result_path, 'r') as f:
                     result_data = json.load(f)
                     category = result_data.get('category')
+                    num_point_pairs = result_data.get('num_point_pairs', 0)
+                    average_iou = result_data.get('average_iou', 0.0)
+                    saved_at = result_data.get('saved_at')
             except:
                 pass
         
@@ -324,7 +373,10 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             if obj['scene_id'] == scene_id and obj['object_id'] == object_id:
                 obj['has_alignment'] = has_alignment
                 obj['category'] = category
-                print(f"[Cache] 更新对象 {scene_id}/{object_id}: category={category}, has_alignment={has_alignment}")
+                obj['num_point_pairs'] = num_point_pairs
+                obj['average_iou'] = average_iou
+                obj['saved_at'] = saved_at
+                print(f"[Cache] 更新对象 {scene_id}/{object_id}: category={category}, has_alignment={has_alignment}, iou={average_iou}")
                 break
     
     def handle_list_aligned_objects(self):
@@ -371,8 +423,74 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         aligned_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))
         self.send_json({'aligned_objects': aligned_objects[:200]})  # 返回前200个
     
+    def handle_next_mv_task(self, current_scene_id, exclude_object_id):
+        """
+        获取下一个待标注的多视角物体。
+        优先返回同场景的物体，其次返回其他场景的物体。
+        
+        "待标注"定义：在 MV_RECON_ROOT 中有 mesh 但在 MV_ALIGNED_ROOT 中没有对应 result.json 的物体。
+        """
+        global _mv_objects_cache, _mv_objects_cache_time
+        
+        # 确保缓存已建立
+        current_time = time.time()
+        if _mv_objects_cache is None or (current_time - _mv_objects_cache_time) > CACHE_TTL:
+            _mv_objects_cache = self._build_mv_objects_cache()
+            _mv_objects_cache_time = current_time
+        
+        # 筛选待标注物体：没有对齐结果且未被标记为invalid的
+        pending_objects = []
+        for obj in _mv_objects_cache:
+            # 排除当前正在标注的物体
+            if (obj['scene_id'] == current_scene_id and 
+                obj['object_id'] == exclude_object_id):
+                continue
+            
+            # 跳过已标注的（has_alignment=True 表示已有对齐结果）
+            if obj.get('has_alignment') or obj.get('category') in ('fixed', 'invalid'):
+                continue
+            
+            pending_objects.append({
+                'scene_id': obj['scene_id'],
+                'object_id': obj['object_id'],
+                'is_same_scene': obj['scene_id'] == current_scene_id
+            })
+        
+        if not pending_objects:
+            self.send_json({
+                'success': True,
+                'has_next': False,
+                'data': None,
+                'remaining_count': 0,
+                'message': 'No more tasks available'
+            })
+            return
+        
+        # 排序：优先同场景
+        pending_objects.sort(key=lambda x: (
+            0 if x['is_same_scene'] else 1,
+            x['scene_id'],
+            x['object_id']
+        ))
+        
+        next_task = pending_objects[0]
+        remaining_count = len(pending_objects)
+        
+        print(f"[next_mv_task] 下一个任务: scene={next_task['scene_id']}, "
+              f"object={next_task['object_id']}, remaining={remaining_count}")
+        
+        self.send_json({
+            'success': True,
+            'has_next': True,
+            'data': {
+                'scene_id': next_task['scene_id'],
+                'object_id': next_task['object_id'],
+            },
+            'remaining_count': remaining_count
+        })
+    
     def _build_mv_objects_cache(self):
-        """构建物体列表缓存（优化：不计算帧数）"""
+        """构建物体列表缓存（包含缩略图、标注统计等信息）"""
         mv_objects = []
         
         # 遍历多视角重建目录
@@ -396,28 +514,45 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 if not os.path.exists(lasa_path):
                     continue
                 
+                # 获取缩略图URL（第一张RGB图）
+                thumbnail_url = None
+                rgb_dir = f"{lasa_path}/raw_jpg"
+                rgb_files = sorted(glob.glob(f"{rgb_dir}/*.jpg"))
+                if rgb_files:
+                    first_frame = os.path.basename(rgb_files[0])
+                    thumbnail_url = f"/data/image/{scene_id}/{object_id}/raw_jpg/{first_frame}"
+                
                 # 检查是否已有对齐结果和分类状态
                 aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
                 has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
                 
-                # 读取分类状态
+                # 读取result.json获取全部元数据
                 category = None
+                num_point_pairs = 0
+                average_iou = 0.0
+                saved_at = None
                 result_path = f"{aligned_path}/result.json"
                 if os.path.exists(result_path):
                     try:
                         with open(result_path, 'r') as f:
                             result_data = json.load(f)
                             category = result_data.get('category')
+                            num_point_pairs = result_data.get('num_point_pairs', 0)
+                            average_iou = result_data.get('average_iou', 0.0)
+                            saved_at = result_data.get('saved_at')
                     except:
                         pass
                 
-                # 不再计算帧数（太慢），加载时再获取
                 mv_objects.append({
                     'scene_id': scene_id,
                     'object_id': object_id,
                     'num_frames': -1,  # 延迟加载
                     'has_alignment': has_alignment,
-                    'category': category
+                    'category': category,
+                    'thumbnail_url': thumbnail_url,
+                    'num_point_pairs': num_point_pairs,
+                    'average_iou': average_iou,
+                    'saved_at': saved_at
                 })
         
         # 按scene_id排序
@@ -771,11 +906,12 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
 
 
 def warmup_cache():
-    """启动时预热缓存"""
+    """启动时预热缓存（委托给 _build_mv_objects_cache 逻辑）"""
     global _mv_objects_cache, _mv_objects_cache_time
     print("[warmup_cache] 正在预热缓存...")
     start_time = time.time()
     
+    # 使用与 _build_mv_objects_cache 相同的逻辑
     mv_objects = []
     for scene_dir in sorted(glob.glob(f"{MV_RECON_ROOT}/*")):
         if not os.path.isdir(scene_dir):
@@ -795,17 +931,31 @@ def warmup_cache():
             if not os.path.exists(lasa_path):
                 continue
             
+            # 缩略图
+            thumbnail_url = None
+            rgb_dir = f"{lasa_path}/raw_jpg"
+            rgb_files = sorted(glob.glob(f"{rgb_dir}/*.jpg"))
+            if rgb_files:
+                first_frame = os.path.basename(rgb_files[0])
+                thumbnail_url = f"/data/image/{scene_id}/{object_id}/raw_jpg/{first_frame}"
+            
             aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
             has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
             
-            # 读取分类状态
+            # 读取result.json
             category = None
+            num_point_pairs = 0
+            average_iou = 0.0
+            saved_at = None
             result_path = f"{aligned_path}/result.json"
             if os.path.exists(result_path):
                 try:
                     with open(result_path, 'r') as f:
                         result_data = json.load(f)
                         category = result_data.get('category')
+                        num_point_pairs = result_data.get('num_point_pairs', 0)
+                        average_iou = result_data.get('average_iou', 0.0)
+                        saved_at = result_data.get('saved_at')
                 except:
                     pass
             
@@ -814,7 +964,11 @@ def warmup_cache():
                 'object_id': object_id,
                 'num_frames': -1,
                 'has_alignment': has_alignment,
-                'category': category
+                'category': category,
+                'thumbnail_url': thumbnail_url,
+                'num_point_pairs': num_point_pairs,
+                'average_iou': average_iou,
+                'saved_at': saved_at
             })
     
     mv_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))

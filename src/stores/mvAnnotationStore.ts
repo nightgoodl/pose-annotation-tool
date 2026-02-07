@@ -101,6 +101,12 @@ interface MVAnnotationStore {
   // ========== 保存 ==========
   savePose: () => Promise<{ success: boolean; pose_path?: string; error?: string }>;
   
+  // ========== 保存并处理下一个 ==========
+  isSavingNext: boolean;
+  remainingCount: number | null;
+  setIsSavingNext: (val: boolean) => void;
+  setRemainingCount: (count: number | null) => void;
+  
   // ========== 重置 ==========
   reset: () => void;
 }
@@ -176,9 +182,11 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       pendingWorldPoint: null
     }));
     
-    // 自动对齐：≥3 点时运行带约束 Umeyama
+    // 自动对齐：≥5 点时用 RANSAC，3-4 点时用普通对齐
     const state = get();
-    if (state.pointPairs.length >= 3) {
+    if (state.pointPairs.length >= 5) {
+      state.runAlignment(true);
+    } else if (state.pointPairs.length >= 3) {
       state.runAlignment(false);
     }
   },
@@ -480,6 +488,7 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       scale: state.calculatedScale,
       error: state.alignmentError,
       category: finalCategory,
+      average_iou: state.averageIoU,
       point_pairs: state.pointPairs.map(p => ({
         frame_id: p.frame_id,
         localPoint: p.localPoint,
@@ -516,6 +525,12 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     }
   },
   
+  // ========== 保存并处理下一个 ==========
+  isSavingNext: false,
+  remainingCount: null,
+  setIsSavingNext: (val) => set({ isSavingNext: val }),
+  setRemainingCount: (count) => set({ remainingCount: count }),
+  
   // ========== 重置 ==========
   reset: () => {
     set({
@@ -533,7 +548,9 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       isAnnotationEnabled: false,
       showGhostWireframe: true,
       maskOpacity: 0.5,
-      useNvdiffrastRender: true
+      useNvdiffrastRender: true,
+      isSavingNext: false,
+      remainingCount: null
     });
   }
 }));

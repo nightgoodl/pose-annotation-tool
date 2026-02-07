@@ -11,11 +11,17 @@ import {
   Eye, 
   EyeOff,
   Crosshair,
-  Layers
+  Layers,
+  SkipForward
 } from 'lucide-react';
 import { useAnnotationStore } from '../stores/annotationStore';
+import { showGlobalToast } from '../hooks/useToast';
 
-export function ControlPanel() {
+interface ControlPanelProps {
+  onSaveAndNext?: () => Promise<void>;
+}
+
+export function ControlPanel({ onSaveAndNext }: ControlPanelProps) {
   const workflowState = useAnnotationStore((state) => state.workflowState);
   const category = useAnnotationStore((state) => state.category);
   const pointPairs = useAnnotationStore((state) => state.pointPairs);
@@ -28,6 +34,8 @@ export function ControlPanel() {
   const currentIoU = useAnnotationStore((state) => state.currentIoU);
   const showGhostWireframe = useAnnotationStore((state) => state.showGhostWireframe);
   const maskOpacity = useAnnotationStore((state) => state.maskOpacity);
+  const isSavingNext = useAnnotationStore((state) => state.isSavingNext);
+  const remainingCount = useAnnotationStore((state) => state.remainingCount);
   
   const removePointPair = useAnnotationStore((state) => state.removePointPair);
   const selectPointPair = useAnnotationStore((state) => state.selectPointPair);
@@ -42,9 +50,9 @@ export function ControlPanel() {
   const handleSave = async () => {
     const result = await savePose();
     if (result.success) {
-      alert(`Pose已保存到: ${result.pose_path}`);
+      showGlobalToast(`Pose已保存到: ${result.pose_path}`, 'success', 3000);
     } else {
-      alert(`保存失败: ${result.error}`);
+      showGlobalToast(`保存失败: ${result.error}`, 'error', 4000);
     }
   };
   
@@ -54,7 +62,7 @@ export function ControlPanel() {
       console.log('Exported annotation:', result);
       // 复制到剪贴板
       navigator.clipboard.writeText(JSON.stringify(result, null, 2))
-        .then(() => alert('标注结果已复制到剪贴板'))
+        .then(() => showGlobalToast('标注结果已复制到剪贴板', 'success'))
         .catch((err) => console.error('复制失败:', err));
     }
   };
@@ -249,6 +257,27 @@ export function ControlPanel() {
             <Save className="w-4 h-4" />
             保存Pose
           </button>
+          
+          {onSaveAndNext && (
+            <button
+              onClick={onSaveAndNext}
+              disabled={isSavingNext}
+              className={`w-full flex items-center justify-center gap-2 py-2 px-4 rounded-lg font-medium transition-colors ${
+                isSavingNext 
+                  ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                  : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+              }`}
+            >
+              <Save className="w-4 h-4" />
+              <SkipForward className="w-4 h-4 -ml-2" />
+              {isSavingNext ? '处理中...' : '保存并处理下一个'}
+              {remainingCount !== null && !isSavingNext && (
+                <span className="ml-1 px-1.5 py-0.5 bg-white/20 rounded-full text-xs">
+                  {remainingCount}
+                </span>
+              )}
+            </button>
+          )}
         </div>
       )}
       
@@ -292,6 +321,8 @@ export function ControlPanel() {
         <div className="font-medium mb-1">快捷键:</div>
         <div>点击模型/图像 - 添加点</div>
         <div>至少3对点后可对齐</div>
+        <div>Ctrl+S - 保存Pose</div>
+        <div>Ctrl+Enter - 保存并下一个</div>
       </div>
     </div>
   );

@@ -68,6 +68,10 @@ export interface MVObjectItem {
   num_frames: number;
   has_alignment: boolean;
   category?: 'valid' | 'fixed' | 'invalid' | null;
+  thumbnail_url?: string | null;
+  num_point_pairs?: number;
+  average_iou?: number;
+  saved_at?: string | null;
 }
 
 // 多视角标注输入数据
