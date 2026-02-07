@@ -49,7 +49,9 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed.query)
         
         # API路由
-        if path == '/api/refresh_cache':
+        if path == '/api/aligned_objects':
+            self.handle_list_aligned_objects()
+        elif path == '/api/refresh_cache':
             # 增量刷新缓存 - 只更新有变化的对象
             global _mv_objects_cache, _mv_objects_cache_time
             scene_id = query.get('scene_id', [None])[0]
@@ -75,6 +77,21 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             object_id = query.get('object_id', [None])[0]
             num_frames = int(query.get('num_frames', [8])[0])
             self.handle_get_mv_object_data(scene_id, object_id, num_frames)
+        elif path == '/api/object_data':
+            # Compatibility endpoint: convert mv_object_data to single-view format
+            scene_id = query.get('scene_id', [None])[0]
+            object_id = query.get('object_id', [None])[0]
+            frame_id = query.get('frame_id', [None])[0]
+            
+            if frame_id == 'multi_view':
+                # This is a multi-view object, convert to single-view format using first frame
+                self.handle_get_object_data_compat(scene_id, object_id)
+            else:
+                # Single-view not supported in this server
+                self.send_json({
+                    'error': 'Single-view objects not supported. Use /api/mv_object_data for multi-view objects.',
+                    'hint': 'For multi-view objects, use frame_id=multi_view or call /api/mv_object_data directly'
+                }, 400)
         elif path.startswith('/data/'):
             # 静态文件服务
             self.serve_data_file(path[6:])
@@ -310,6 +327,50 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 print(f"[Cache] 更新对象 {scene_id}/{object_id}: category={category}, has_alignment={has_alignment}")
                 break
     
+    def handle_list_aligned_objects(self):
+        """列出所有已对齐的物体（单视图兼容性）"""
+        aligned_objects = []
+        
+        # 对于多视角数据，从MV_ALIGNED_ROOT读取
+        for scene_dir in sorted(glob.glob(f"{MV_ALIGNED_ROOT}/*")):
+            if not os.path.isdir(scene_dir):
+                continue
+            scene_id = os.path.basename(scene_dir)
+            
+            for obj_dir in sorted(glob.glob(f"{scene_dir}/*")):
+                if not os.path.isdir(obj_dir):
+                    continue
+                object_id = os.path.basename(obj_dir)
+                
+                # 查找world_pose文件（多视角只有一个world_pose.npy）
+                world_pose_file = f"{obj_dir}/world_pose.npy"
+                if os.path.exists(world_pose_file):
+                    # 读取result.json获取信息
+                    result_file = f"{obj_dir}/result.json"
+                    error = None
+                    category = None
+                    if os.path.exists(result_file):
+                        try:
+                            with open(result_file) as f:
+                                result = json.load(f)
+                                error = result.get('alignment_error')
+                                category = result.get('category')
+                        except:
+                            pass
+                    
+                    aligned_objects.append({
+                        'scene_id': scene_id,
+                        'object_id': object_id,
+                        'frame_id': 'multi_view',  # 多视角标记
+                        'iou': None,  # 多视角没有单帧IOU
+                        'error': error,
+                        'category': category
+                    })
+        
+        # 按scene_id排序
+        aligned_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))
+        self.send_json({'aligned_objects': aligned_objects[:200]})  # 返回前200个
+    
     def _build_mv_objects_cache(self):
         """构建物体列表缓存（优化：不计算帧数）"""
         mv_objects = []
@@ -372,6 +433,49 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         try:
             data = self.load_mv_object_data(scene_id, object_id, num_frames)
             self.send_json(data)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.send_json({'error': str(e)}, 500)
+    
+    def handle_get_object_data_compat(self, scene_id, object_id):
+        """
+        兼容性端点: 将多视角数据转换为单视图格式
+        使用第一帧的数据来兼容单视图App
+        """
+        if not all([scene_id, object_id]):
+            self.send_json({'error': 'scene_id, object_id required'}, 400)
+            return
+        
+        try:
+            # 加载多视角数据（只需要1帧）
+            mv_data = self.load_mv_object_data(scene_id, object_id, num_frames=1)
+            
+            if not mv_data['frames']:
+                self.send_json({'error': 'No frames available'}, 404)
+                return
+            
+            # 使用第一帧的数据
+            first_frame = mv_data['frames'][0]
+            
+            # 转换为单视图格式
+            single_view_data = {
+                'scene_id': scene_id,
+                'object_id': object_id,
+                'frame_id': first_frame['frame_id'],
+                'rgb_url': first_frame['rgb_url'],
+                'mask_url': first_frame['mask_url'],
+                'depth_url': first_frame['depth_url'],
+                'camera_intrinsics': first_frame['camera_intrinsics'],
+                'camera_extrinsics': first_frame['camera_extrinsics'],
+                'world_pose': mv_data['world_pose'],
+                'mesh_url': mv_data['mesh_url'],
+                'cad_model_url': mv_data['mesh_url'],  # 别名
+                'gt_bbox': mv_data.get('gt_bbox'),
+                'mesh_info': mv_data.get('mesh_info')
+            }
+            
+            self.send_json(single_view_data)
         except Exception as e:
             import traceback
             traceback.print_exc()

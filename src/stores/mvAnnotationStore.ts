@@ -23,6 +23,13 @@ import {
   multiply4x4
 } from '../utils/math';
 
+// Get API base path from Vite's BASE_URL
+const getApiBasePath = () => {
+  // @ts-ignore - import.meta.env is available in Vite
+  const basePath = import.meta.env.BASE_URL || '/';
+  return basePath.replace(/\/$/, ''); // Remove trailing slash
+};
+
 interface MVAnnotationStore {
   // ========== 输入数据 ==========
   currentInput: MVAnnotationInput | null;
@@ -484,7 +491,8 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     console.log('[saveMVPose] 保存数据:', requestData);
     
     try {
-      const response = await fetch('/api/save_mv_pose', {
+      const apiPath = `${getApiBasePath()}/api/save_mv_pose`;
+      const response = await fetch(apiPath, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'

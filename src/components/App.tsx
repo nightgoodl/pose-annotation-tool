@@ -16,8 +16,10 @@ import { ClassificationPanel } from './ClassificationPanel';
 import { ControlPanel } from './ControlPanel';
 import type { AnnotationInput, Matrix4 } from '../types';
 
-// 数据服务器地址
-const DATA_SERVER = 'http://localhost:8081';
+// 数据服务器地址 - 使用base路径以支持tunnel
+// import.meta.env.BASE_URL includes trailing slash, so we need to remove it
+const BASE_PATH = ((import.meta as any).env?.BASE_URL || '/').replace(/\/$/, '');
+const DATA_SERVER = BASE_PATH;
 // 解码服务通过数据服务器代理访问
 
 // 已对齐物体的类型

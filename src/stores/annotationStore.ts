@@ -14,6 +14,13 @@ import type {
 } from '../types';
 import { solveUmeyama } from '../utils/math';
 
+// Get API base path from Vite's BASE_URL
+const getApiBasePath = () => {
+  // @ts-ignore - import.meta.env is available in Vite
+  const basePath = import.meta.env.BASE_URL || '/';
+  return basePath.replace(/\/$/, ''); // Remove trailing slash
+};
+
 interface AnnotationStore {
   // ========== 输入数据 ==========
   currentInput: AnnotationInput | null;
@@ -320,7 +327,8 @@ export const useAnnotationStore = create<AnnotationStore>((set, get) => ({
     console.log('[savePose] 保存数据:', requestData);
     
     try {
-      const response = await fetch('http://localhost:8082/api/save_pose', {
+      const apiPath = `${getApiBasePath()}/api/save_pose`;
+      const response = await fetch(apiPath, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'

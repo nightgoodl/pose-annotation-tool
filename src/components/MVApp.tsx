@@ -17,8 +17,10 @@ import { showGlobalToast } from '../hooks/useToast';
 import type { MVAnnotationInput, MVObjectItem, MVObjectData, BboxInfo, MeshInfo } from '../types/multiview';
 import type { Matrix4 } from '../types';
 
-// 数据服务器地址 - 使用相对路径，通过Vite代理转发
-const MV_DATA_SERVER = '';
+// 数据服务器地址 - 使用base路径以支持tunnel
+// import.meta.env.BASE_URL includes trailing slash, so we need to remove it
+const BASE_PATH = ((import.meta as any).env?.BASE_URL || '/').replace(/\/$/, '');
+const MV_DATA_SERVER = BASE_PATH;
 
 // 从服务器加载多视角物体数据
 async function loadMVObjectData(sceneId: string, objectId: string, numFrames: number = 4): Promise<MVAnnotationInput | null> {
@@ -106,7 +108,7 @@ function MVDataSelector({ onSelect, savedObjectInfo }: MVDataSelectorProps) {
       }));
       
       // 异步增量刷新后端缓存（不阻塞UI，只更新单个对象）
-      fetch(`/api/refresh_cache?scene_id=${sceneId}&object_id=${objectId}`).catch(() => {});
+      fetch(`${BASE_PATH}/api/refresh_cache?scene_id=${sceneId}&object_id=${objectId}`).catch(() => {});
     }
   }, [savedObjectInfo]);
   
