@@ -9,6 +9,13 @@ export interface BboxInfo {
   position: [number, number, number];  // 中心点（世界坐标）
   scale: [number, number, number];     // 半轴长度
   R?: number[][];                      // 旋转矩阵
+  corners?: number[][];                // 8 个角点（世界坐标系）- 优先使用
+}
+
+// Mesh 信息（用于 Bbox Align）
+export interface MeshInfo {
+  center: [number, number, number];    // 质心
+  extent: [number, number, number];    // 范围 (max - min)
 }
 
 // 单帧数据
@@ -41,6 +48,7 @@ export interface MVObjectData {
   frames: FrameData[];
   total_frames: number;
   gt_bbox: BboxInfo | null;
+  mesh_info: MeshInfo | null;
 }
 
 // 多视角点对匹配 (包含帧信息)
@@ -66,9 +74,11 @@ export interface MVObjectItem {
 export interface MVAnnotationInput {
   objectId: string;           // scene_id_object_id
   meshUrl: string;            // mesh文件URL
+  meshPath: string;           // mesh文件绝对路径（用于后端渲染）
   frames: FrameData[];        // 多帧数据
   initialPose: Matrix4 | null;  // 初始pose
   gtBbox: BboxInfo | null;    // GT bbox信息
+  meshInfo: MeshInfo | null;  // Mesh信息（用于 Bbox Align）
 }
 
 // 多视角标注输出结果

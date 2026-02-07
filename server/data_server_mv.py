@@ -13,9 +13,20 @@ import json
 import glob
 import numpy as np
 import time
+import trimesh
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+
+# 渲染服务（懒加载）
+_render_service = None
+def get_render_service():
+    global _render_service
+    if _render_service is None:
+        from render_service import get_renderer
+        _render_service = get_renderer()
+        print("[render_service] 初始化nvdiffrast渲染服务")
+    return _render_service
 
 # 数据路径配置
 DATA_ROOT = "/root/csz/data_partcrafter"
@@ -115,6 +126,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         
         if path == '/api/save_mv_pose':
             self.handle_save_mv_pose(data)
+        elif path == '/api/render_mesh':
+            self.handle_render_mesh(data)
         else:
             self.send_json({'error': 'Unknown endpoint'}, 404)
     
@@ -183,6 +196,53 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'pose_path': pose_path,
             'result_path': result_path
         })
+    
+    def handle_render_mesh(self, data):
+        """
+        渲染mesh到指定相机视角
+        
+        输入格式:
+        {
+            "mesh_path": "/path/to/mesh.glb",
+            "pose": [[...], [...], [...], [...]],  # 4x4矩阵
+            "intrinsics": {"fx": 500, "fy": 500, "cx": 320, "cy": 240},
+            "extrinsics": [[...], [...], [...], [...]],  # 4x4 camera-to-world
+            "image_size": [480, 640]  # [H, W]
+        }
+        
+        输出: PNG图像（RGBA）
+        """
+        mesh_path = data.get('mesh_path')
+        pose = data.get('pose')
+        intrinsics = data.get('intrinsics')
+        extrinsics = data.get('extrinsics')
+        image_size = data.get('image_size')
+        
+        if not all([mesh_path, pose, intrinsics, extrinsics, image_size]):
+            self.send_json({'error': 'Missing required fields'}, 400)
+            return
+        
+        if not os.path.exists(mesh_path):
+            self.send_json({'error': f'Mesh not found: {mesh_path}'}, 404)
+            return
+        
+        try:
+            render_service = get_render_service()
+            
+            pose_np = np.array(pose, dtype=np.float64)
+            extrinsics_np = np.array(extrinsics, dtype=np.float64)
+            image_size_tuple = tuple(image_size)
+            
+            png_data = render_service.render_to_png(
+                mesh_path, pose_np, intrinsics, extrinsics_np, image_size_tuple
+            )
+            
+            self.send_binary(png_data, 'image/png')
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.send_json({'error': str(e)}, 500)
     
     def handle_list_mv_objects(self, page=1, page_size=50, scene_filter=None):
         """列出多视角重建物体（带分页和缓存）"""
@@ -476,20 +536,60 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         # 8. 读取GT bbox（从instances.json）
         gt_bbox = None
         instances_path = f"{LASA1M_ROOT}/{scene_id}/instances.json"
+        print(f"[load_mv_object_data] 查找 gt_bbox: instances_path={instances_path}, object_id={object_id}")
         if os.path.exists(instances_path):
             try:
                 with open(instances_path, 'r') as f:
                     instances = json.load(f)
+                print(f"[load_mv_object_data] instances.json 加载成功, 共 {len(instances)} 个物体")
                 for inst in instances:
                     if inst.get('id') == object_id:
                         gt_bbox = {
                             'position': inst.get('position'),   # 中心点（世界坐标）
                             'scale': inst.get('scale'),         # 半轴长度（局部坐标系）
-                            'R': inst.get('R')                  # 旋转矩阵 (可选)
+                            'R': inst.get('R'),                 # 旋转矩阵 (可选)
+                            'corners': inst.get('corners')      # 8 个角点（世界坐标系）- 直接使用！
                         }
+                        print(f"[load_mv_object_data] 找到 gt_bbox: position={gt_bbox['position']}, scale={gt_bbox['scale']}, has_corners={gt_bbox['corners'] is not None}")
                         break
+                if gt_bbox is None:
+                    print(f"[load_mv_object_data] 警告: 未在 instances.json 中找到 object_id={object_id}")
             except Exception as e:
                 print(f"[load_mv_object_data] 警告: 加载instances.json失败: {e}")
+        else:
+            print(f"[load_mv_object_data] 警告: instances.json 不存在: {instances_path}")
+        
+        # 9. 加载mesh计算mesh_info (center, extent)
+        mesh_info = None
+        try:
+            mesh = trimesh.load(mesh_path)
+            vertices = None
+            
+            # 处理 Scene 对象（glb 文件通常返回 Scene）
+            if isinstance(mesh, trimesh.Scene):
+                if len(mesh.geometry) > 0:
+                    # 合并所有 geometry 的顶点
+                    all_vertices = []
+                    for geom in mesh.geometry.values():
+                        if hasattr(geom, 'vertices'):
+                            all_vertices.append(np.array(geom.vertices))
+                    if all_vertices:
+                        vertices = np.vstack(all_vertices)
+            elif hasattr(mesh, 'vertices') and len(mesh.vertices) > 0:
+                vertices = np.array(mesh.vertices)
+            
+            if vertices is not None and len(vertices) > 0:
+                mesh_center = vertices.mean(axis=0).tolist()
+                mesh_extent = (vertices.max(axis=0) - vertices.min(axis=0)).tolist()
+                mesh_info = {
+                    'center': mesh_center,
+                    'extent': mesh_extent
+                }
+                print(f"[load_mv_object_data] mesh_info: center={mesh_center}, extent={mesh_extent}")
+            else:
+                print(f"[load_mv_object_data] 警告: mesh 无顶点数据")
+        except Exception as e:
+            print(f"[load_mv_object_data] 警告: 加载mesh失败: {e}")
         
         return {
             'scene_id': scene_id,
@@ -499,7 +599,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'world_pose': world_pose,
             'frames': frames,
             'total_frames': total_frames,
-            'gt_bbox': gt_bbox
+            'gt_bbox': gt_bbox,
+            'mesh_info': mesh_info
         }
     
     def serve_data_file(self, path):

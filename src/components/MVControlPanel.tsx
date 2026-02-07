@@ -15,6 +15,7 @@ export function MVControlPanel() {
   const averageIoU = useMVAnnotationStore((state) => state.averageIoU);
   const showGhostWireframe = useMVAnnotationStore((state) => state.showGhostWireframe);
   const maskOpacity = useMVAnnotationStore((state) => state.maskOpacity);
+  const useNvdiffrastRender = useMVAnnotationStore((state) => state.useNvdiffrastRender);
   
   const removePointPair = useMVAnnotationStore((state) => state.removePointPair);
   const clearPointPairs = useMVAnnotationStore((state) => state.clearPointPairs);
@@ -22,7 +23,9 @@ export function MVControlPanel() {
   const resetAlignment = useMVAnnotationStore((state) => state.resetAlignment);
   const setShowGhostWireframe = useMVAnnotationStore((state) => state.setShowGhostWireframe);
   const setMaskOpacity = useMVAnnotationStore((state) => state.setMaskOpacity);
+  const setUseNvdiffrastRender = useMVAnnotationStore((state) => state.setUseNvdiffrastRender);
   const savePose = useMVAnnotationStore((state) => state.savePose);
+  const currentInput = useMVAnnotationStore((state) => state.currentInput);
   
   // 统计各帧的点数
   const framePointCounts = new Map<string, number>();
@@ -86,8 +89,19 @@ export function MVControlPanel() {
               onChange={(e) => setShowGhostWireframe(e.target.checked)}
               className="rounded"
             />
-            显示mesh投影
+            显示mesh投影 (仅缩略图)
           </label>
+          {showGhostWireframe && (
+            <label className="flex items-center gap-2 text-xs text-gray-400 ml-4">
+              <input
+                type="checkbox"
+                checked={useNvdiffrastRender}
+                onChange={(e) => setUseNvdiffrastRender(e.target.checked)}
+                className="rounded"
+              />
+              GPU渲染 (nvdiffrast)
+            </label>
+          )}
         </div>
       </div>
       
@@ -95,6 +109,7 @@ export function MVControlPanel() {
       {workflowState === 'annotation' && (
         <div className="bg-gray-700 rounded p-3">
           <div className="text-sm text-gray-300 mb-2">对齐计算</div>
+          
           <div className="flex gap-2 mb-2">
             <button
               onClick={() => runAlignment(false)}

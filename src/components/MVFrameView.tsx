@@ -4,14 +4,14 @@
  * 显示单帧图像，支持点击标注关键点，显示mesh投影
  */
 
-import { useCallback, useMemo, useState, useEffect } from 'react';
+import { useCallback, useMemo, useState, useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useMVAnnotationStore } from '../stores/mvAnnotationStore';
 import { unprojectPoint } from '../utils/math';
 import { showGlobalToast } from '../hooks/useToast';
 import type { Matrix4, CameraIntrinsics } from '../types';
-import type { FrameData, MVPointPair } from '../types/multiview';
+import type { FrameData, MVPointPair, BboxInfo } from '../types/multiview';
 
 // ========== 工具函数 ==========
 
@@ -50,6 +50,216 @@ interface ProjectedMeshOutlineProps {
   imageHeight: number;
   maskUrl?: string;
   onIoUCalculated?: (iou: number) => void;
+}
+
+// ========== Nvdiffrast 渲染组件 ==========
+
+interface RenderedMeshOverlayProps {
+  meshPath: string;  // 后端 mesh 文件路径
+  pose: Matrix4;
+  intrinsics: CameraIntrinsics;
+  extrinsics: Matrix4;
+  imageWidth: number;
+  imageHeight: number;
+  serverUrl: string;
+  maskUrl?: string;
+  onIoUCalculated?: (iou: number) => void;
+}
+
+function RenderedMeshOverlay({ 
+  meshPath, pose, intrinsics, extrinsics, imageWidth, imageHeight, serverUrl, maskUrl, onIoUCalculated 
+}: RenderedMeshOverlayProps) {
+  const [renderedImage, setRenderedImage] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // 调用后端渲染 API
+  useEffect(() => {
+    if (!meshPath || !pose || !intrinsics || !extrinsics) {
+      setRenderedImage(null);
+      return;
+    }
+    
+    // 防抖：延迟 100ms 后发起请求
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+    }
+    
+    debounceTimerRef.current = setTimeout(() => {
+      // 取消之前的请求
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+      abortControllerRef.current = new AbortController();
+      
+      setLoading(true);
+      setError(null);
+      
+      const requestBody = {
+        mesh_path: meshPath,
+        pose: pose,
+        intrinsics: {
+          fx: intrinsics.fx,
+          fy: intrinsics.fy,
+          cx: intrinsics.cx,
+          cy: intrinsics.cy
+        },
+        extrinsics: extrinsics,
+        image_size: [imageHeight, imageWidth]  // [H, W]
+      };
+      
+      fetch(`${serverUrl}/api/render_mesh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+        signal: abortControllerRef.current.signal
+      })
+        .then(res => {
+          if (!res.ok) {
+            return res.text().then(text => {
+              let errorMsg = `HTTP ${res.status}`;
+              try {
+                const err = JSON.parse(text);
+                errorMsg = err.error || errorMsg;
+              } catch {
+                errorMsg = text || errorMsg;
+              }
+              throw new Error(errorMsg);
+            });
+          }
+          return res.blob();
+        })
+        .then(blob => {
+          const url = URL.createObjectURL(blob);
+          setRenderedImage(prev => {
+            if (prev) URL.revokeObjectURL(prev);
+            return url;
+          });
+          setLoading(false);
+        })
+        .catch(err => {
+          if (err.name !== 'AbortError') {
+            console.error('[RenderedMeshOverlay] Render error:', err);
+            setError(err.message);
+            setLoading(false);
+          }
+        });
+    }, 100);
+    
+    return () => {
+      if (debounceTimerRef.current) {
+        clearTimeout(debounceTimerRef.current);
+      }
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [meshPath, pose, intrinsics, extrinsics, imageWidth, imageHeight, serverUrl]);
+  
+  // 清理 URL
+  useEffect(() => {
+    return () => {
+      if (renderedImage) {
+        URL.revokeObjectURL(renderedImage);
+      }
+    };
+  }, []);
+  
+  // IoU 计算：使用渲染图像的 alpha 通道作为 mask
+  useEffect(() => {
+    if (!renderedImage || !maskUrl || !onIoUCalculated) return;
+    
+    const renderImg = new Image();
+    renderImg.crossOrigin = 'anonymous';
+    
+    renderImg.onload = () => {
+      const maskImg = new Image();
+      maskImg.crossOrigin = 'anonymous';
+      
+      maskImg.onload = () => {
+        // 创建 canvas 获取渲染图像的 alpha 通道
+        const renderCanvas = document.createElement('canvas');
+        renderCanvas.width = renderImg.width;
+        renderCanvas.height = renderImg.height;
+        const renderCtx = renderCanvas.getContext('2d');
+        if (!renderCtx) return;
+        renderCtx.drawImage(renderImg, 0, 0);
+        const renderData = renderCtx.getImageData(0, 0, renderImg.width, renderImg.height);
+        
+        // 创建 canvas 获取 GT mask
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = maskImg.width;
+        maskCanvas.height = maskImg.height;
+        const maskCtx = maskCanvas.getContext('2d');
+        if (!maskCtx) return;
+        maskCtx.drawImage(maskImg, 0, 0);
+        const maskData = maskCtx.getImageData(0, 0, maskImg.width, maskImg.height);
+        
+        // 采样计算 IoU
+        const sampleStep = Math.max(4, Math.floor(Math.max(imageWidth, imageHeight) / 100));
+        let intersection = 0;
+        let projectionArea = 0;
+        let maskArea = 0;
+        
+        for (let v = 0; v < imageHeight; v += sampleStep) {
+          for (let u = 0; u < imageWidth; u += sampleStep) {
+            // 渲染图像 alpha 通道
+            const renderU = Math.round(u * renderImg.width / imageWidth);
+            const renderV = Math.round(v * renderImg.height / imageHeight);
+            const renderIdx = (renderV * renderImg.width + renderU) * 4 + 3;  // alpha 通道
+            const inProjection = renderData.data[renderIdx] > 127;
+            
+            // GT mask
+            const maskU = Math.round(u * maskImg.width / imageWidth);
+            const maskV = Math.round(v * maskImg.height / imageHeight);
+            const maskIdx = (maskV * maskImg.width + maskU) * 4;
+            const inMask = maskData.data[maskIdx] > 127;
+            
+            if (inProjection) projectionArea++;
+            if (inMask) maskArea++;
+            if (inProjection && inMask) intersection++;
+          }
+        }
+        
+        const union = projectionArea + maskArea - intersection;
+        const iou = union > 0 ? intersection / union : 0;
+        onIoUCalculated(iou);
+      };
+      
+      maskImg.src = maskUrl;
+    };
+    
+    renderImg.src = renderedImage;
+  }, [renderedImage, maskUrl, onIoUCalculated, imageWidth, imageHeight]);
+  
+  if (!renderedImage && !loading) {
+    return null;
+  }
+  
+  return (
+    <div className="absolute inset-0 w-full h-full pointer-events-none">
+      {loading && (
+        <div className="absolute top-2 left-2 bg-black/50 text-white text-xs px-2 py-1 rounded">
+          渲染中...
+        </div>
+      )}
+      {error && (
+        <div className="absolute top-2 left-2 bg-red-600/80 text-white text-xs px-2 py-1 rounded">
+          {error}
+        </div>
+      )}
+      {renderedImage && (
+        <img
+          src={renderedImage}
+          alt="Rendered mesh"
+          className="absolute inset-0 w-full h-full object-contain"
+          style={{ mixBlendMode: 'normal' }}
+        />
+      )}
+    </div>
+  );
 }
 
 // 计算凸包 (Graham Scan算法)
@@ -437,26 +647,150 @@ function PixelMarkerOverlay({ width, height, frameId, pointPairs, pendingWorldPo
   );
 }
 
+// ========== GT Bbox 投影可视化组件 ==========
+
+interface ProjectedBboxOverlayProps {
+  gtBbox: BboxInfo;
+  intrinsics: CameraIntrinsics;
+  extrinsics: Matrix4;
+  imageWidth: number;
+  imageHeight: number;
+}
+
+function ProjectedBboxOverlay({ gtBbox, intrinsics, extrinsics, imageWidth, imageHeight }: ProjectedBboxOverlayProps) {
+  const projectedCorners = useMemo(() => {
+    // 优先使用 instances.json 中直接存储的 corners
+    let worldCorners: [number, number, number][];
+    
+    if (gtBbox.corners && gtBbox.corners.length === 8) {
+      // 直接使用 corners
+      worldCorners = gtBbox.corners as [number, number, number][];
+      console.log('[ProjectedBboxOverlay] 使用 corners 字段');
+    } else {
+      // 用 position/scale/R 计算（fallback）
+      console.log('[ProjectedBboxOverlay] 警告: 没有 corners 字段，使用 position/scale/R 计算');
+      const center = gtBbox.position;
+      const scale = gtBbox.scale;
+      const R = gtBbox.R || [[1,0,0],[0,1,0],[0,0,1]];
+      
+      const localCorners = [
+        [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+        [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]
+      ];
+      
+      worldCorners = localCorners.map(([lx, ly, lz]) => {
+        const sx = lx * scale[0];
+        const sy = ly * scale[1];
+        const sz = lz * scale[2];
+        const rx = R[0][0] * sx + R[0][1] * sy + R[0][2] * sz;
+        const ry = R[1][0] * sx + R[1][1] * sy + R[1][2] * sz;
+        const rz = R[2][0] * sx + R[2][1] * sy + R[2][2] * sz;
+        return [center[0] + rx, center[1] + ry, center[2] + rz] as [number, number, number];
+      });
+    }
+    
+    // 投影到图像
+    const { fx, fy, cx, cy } = intrinsics;
+    const camR = [
+      [extrinsics[0][0], extrinsics[0][1], extrinsics[0][2]],
+      [extrinsics[1][0], extrinsics[1][1], extrinsics[1][2]],
+      [extrinsics[2][0], extrinsics[2][1], extrinsics[2][2]]
+    ];
+    const camT = [extrinsics[0][3], extrinsics[1][3], extrinsics[2][3]];
+    
+    const projected: { x: number; y: number; valid: boolean }[] = worldCorners.map(([wx, wy, wz]) => {
+      // 世界坐标 -> 相机坐标
+      const dx = wx - camT[0];
+      const dy = wy - camT[1];
+      const dz = wz - camT[2];
+      
+      // R^T * (P - t)
+      const camX = camR[0][0] * dx + camR[1][0] * dy + camR[2][0] * dz;
+      const camY = camR[0][1] * dx + camR[1][1] * dy + camR[2][1] * dz;
+      const camZ = camR[0][2] * dx + camR[1][2] * dy + camR[2][2] * dz;
+      
+      if (camZ <= 0.01) {
+        return { x: 0, y: 0, valid: false };
+      }
+      
+      const u = fx * camX / camZ + cx;
+      const v = fy * camY / camZ + cy;
+      
+      return { x: u, y: v, valid: true };
+    });
+    
+    console.log('[ProjectedBboxOverlay] GT Bbox corners projected:', projected);
+    
+    return projected;
+  }, [gtBbox, intrinsics, extrinsics]);
+  
+  // Bbox 的 12 条边
+  const edges = [
+    [0, 1], [1, 2], [2, 3], [3, 0],  // 底面
+    [4, 5], [5, 6], [6, 7], [7, 4],  // 顶面
+    [0, 4], [1, 5], [2, 6], [3, 7]   // 侧边
+  ];
+  
+  return (
+    <svg 
+      className="absolute inset-0 w-full h-full pointer-events-none"
+      viewBox={`0 0 ${imageWidth} ${imageHeight}`}
+      preserveAspectRatio="none"
+    >
+      {/* 绘制边 */}
+      {edges.map(([i, j], idx) => {
+        const p1 = projectedCorners[i];
+        const p2 = projectedCorners[j];
+        if (!p1.valid || !p2.valid) return null;
+        return (
+          <line
+            key={idx}
+            x1={p1.x} y1={p1.y}
+            x2={p2.x} y2={p2.y}
+            stroke="#00ff00"
+            strokeWidth="2"
+          />
+        );
+      })}
+      {/* 绘制角点 */}
+      {projectedCorners.map((p, idx) => (
+        p.valid && (
+          <circle
+            key={idx}
+            cx={p.x} cy={p.y}
+            r="4"
+            fill="#00ff00"
+          />
+        )
+      ))}
+    </svg>
+  );
+}
+
 // ========== 主组件 ==========
 
 interface MVFrameViewProps {
   frame: FrameData;
   modelUrl: string;
+  meshPath?: string;  // 后端 mesh 文件的绝对路径，用于 nvdiffrast 渲染
   pose: Matrix4 | null;
   isActive: boolean;
   onSelect: () => void;
   serverUrl: string;
   enlarged?: boolean;
+  splitView?: boolean;  // 是否使用分屏模式（左侧原图，右侧渲染预览）
 }
 
-export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverUrl, enlarged = false }: MVFrameViewProps) {
+export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelect, serverUrl, enlarged = false, splitView = false }: MVFrameViewProps) {
   const isEnabled = useMVAnnotationStore((state) => state.isAnnotationEnabled);
   const showGhostWireframe = useMVAnnotationStore((state) => state.showGhostWireframe);
+  const useNvdiffrastRender = useMVAnnotationStore((state) => state.useNvdiffrastRender);
   const maskOpacity = useMVAnnotationStore((state) => state.maskOpacity);
   const pointPairs = useMVAnnotationStore((state) => state.pointPairs);
   const pendingWorldPoint = useMVAnnotationStore((state) => state.pendingWorldPoint);
   const pendingLocalPoint = useMVAnnotationStore((state) => state.pendingLocalPoint);
   const setPendingWorldPoint = useMVAnnotationStore((state) => state.setPendingWorldPoint);
+  const currentInput = useMVAnnotationStore((state) => state.currentInput);
   const updateFrameDepth = useMVAnnotationStore((state) => state.updateFrameDepth);
   const setFrameIoU = useMVAnnotationStore((state) => state.setFrameIoU);
   
@@ -671,78 +1005,227 @@ export function MVFrameView({ frame, modelUrl, pose, isActive, onSelect, serverU
       )}
       
       {/* 图像区域 */}
-      <div className={`${enlarged ? 'flex items-center justify-center p-2' : ''}`}>
-        {/* 图像包装器 - 确保叠加层与图像对齐 */}
-        <div className="relative" style={{ display: 'inline-block' }}>
-          {/* 主图像 - 底层 */}
-          <img
-            src={`${serverUrl}${frame.rgb_url}`}
-            alt={`Frame ${frame.frame_id}`}
-            className={enlarged ? 'max-w-full h-auto block' : 'w-full h-auto block'}
-            style={enlarged ? { maxHeight: '60vh' } : undefined}
-            onLoad={(e) => {
-              const img = e.currentTarget;
-              setActualImageSize({ width: img.naturalWidth, height: img.naturalHeight });
-            }}
-          />
+      {enlarged && splitView ? (
+        // 分屏模式：左侧原图，右侧渲染预览
+        <div className="flex gap-2 p-2">
+          {/* 左侧：原图 */}
+          <div className="flex-1 flex flex-col">
+            <div className="text-center text-sm text-gray-400 mb-1">原图</div>
+            <div className="relative" style={{ display: 'inline-block' }}>
+              {/* 主图像 */}
+              <img
+                src={`${serverUrl}${frame.rgb_url}`}
+                alt={`Frame ${frame.frame_id}`}
+                className="max-w-full h-auto block"
+                style={{ maxHeight: '60vh' }}
+                onLoad={(e) => {
+                  const img = e.currentTarget;
+                  setActualImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+                }}
+              />
+              
+              {/* Mask叠加 */}
+              {frame.mask_url && maskOpacity > 0 && (
+                <img 
+                  src={`${serverUrl}${frame.mask_url}`}
+                  alt="Mask"
+                  className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                  style={{ opacity: maskOpacity * 0.6 }}
+                />
+              )}
+              
+              {/* 点标记 */}
+              <div className="absolute inset-0 w-full h-full pointer-events-none">
+                <PixelMarkerOverlay
+                  width={imageWidth}
+                  height={imageHeight}
+                  frameId={frame.frame_id}
+                  pointPairs={pointPairs}
+                  pendingWorldPoint={pendingWorldPoint}
+                />
+              </div>
+              
+              {/* 透明点击层 - 只在左侧支持点击 */}
+              <div 
+                className={`absolute top-0 left-0 right-0 bottom-0 ${isEnabled && isActive ? 'cursor-crosshair' : 'cursor-pointer'}`}
+                style={{ 
+                  zIndex: 100,
+                  touchAction: 'none'
+                }}
+                onClick={(e) => {
+                  if (isEnabled && isActive) {
+                    handleImageClick(e);
+                  }
+                }}
+              />
+            </div>
+          </div>
           
-          {/* Mask叠加 - 与图像完全对齐 */}
-          {frame.mask_url && maskOpacity > 0 && (
-            <img 
-              src={`${serverUrl}${frame.mask_url}`}
-              alt="Mask"
-              className="absolute inset-0 w-full h-full pointer-events-none object-contain"
-              style={{ opacity: maskOpacity * 0.6 }}
+          {/* 右侧：渲染预览 */}
+          <div className="flex-1 flex flex-col">
+            <div className="text-center text-sm text-gray-400 mb-1">渲染预览</div>
+            <div className="relative" style={{ display: 'inline-block' }}>
+              {/* 主图像 */}
+              <img
+                src={`${serverUrl}${frame.rgb_url}`}
+                alt={`Frame ${frame.frame_id}`}
+                className="max-w-full h-auto block"
+                style={{ maxHeight: '60vh' }}
+              />
+              
+              {/* Mask叠加 */}
+              {frame.mask_url && maskOpacity > 0 && (
+                <img 
+                  src={`${serverUrl}${frame.mask_url}`}
+                  alt="Mask"
+                  className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                  style={{ opacity: maskOpacity * 0.6 }}
+                />
+              )}
+              
+              {/* Mesh投影 - 强制显示 */}
+              {pose && intrinsics && (
+                useNvdiffrastRender && meshPath ? (
+                  <RenderedMeshOverlay
+                    meshPath={meshPath}
+                    pose={pose}
+                    intrinsics={intrinsics}
+                    extrinsics={frame.camera_extrinsics}
+                    imageWidth={imageWidth}
+                    imageHeight={imageHeight}
+                    serverUrl={serverUrl}
+                    maskUrl={frame.mask_url ? `${serverUrl}${frame.mask_url}` : undefined}
+                    onIoUCalculated={handleIoUCalculated}
+                  />
+                ) : (
+                  <div className="absolute inset-0 w-full h-full pointer-events-none">
+                    <ProjectedMeshOutline
+                      modelUrl={`${serverUrl}${modelUrl}`}
+                      pose={pose}
+                      intrinsics={intrinsics}
+                      extrinsics={frame.camera_extrinsics}
+                      imageWidth={imageWidth}
+                      imageHeight={imageHeight}
+                      maskUrl={frame.mask_url ? `${serverUrl}${frame.mask_url}` : undefined}
+                      onIoUCalculated={handleIoUCalculated}
+                    />
+                  </div>
+                )
+              )}
+              
+              {/* 点标记（只读） */}
+              <div className="absolute inset-0 w-full h-full pointer-events-none">
+                <PixelMarkerOverlay
+                  width={imageWidth}
+                  height={imageHeight}
+                  frameId={frame.frame_id}
+                  pointPairs={pointPairs}
+                  pendingWorldPoint={pendingWorldPoint}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        // 原有的单图显示模式
+        <div className={`${enlarged ? 'flex items-center justify-center p-2' : ''}`}>
+          {/* 图像包装器 - 确保叠加层与图像对齐 */}
+          <div className="relative" style={{ display: 'inline-block' }}>
+            {/* 主图像 - 底层 */}
+            <img
+              src={`${serverUrl}${frame.rgb_url}`}
+              alt={`Frame ${frame.frame_id}`}
+              className={enlarged ? 'max-w-full h-auto block' : 'w-full h-auto block'}
+              style={enlarged ? { maxHeight: '60vh' } : undefined}
+              onLoad={(e) => {
+                const img = e.currentTarget;
+                setActualImageSize({ width: img.naturalWidth, height: img.naturalHeight });
+              }}
             />
-          )}
-          
-          {/* Mesh投影 */}
-          {showGhostWireframe && pose && intrinsics && (
-            <div className="absolute inset-0 w-full h-full pointer-events-none">
-              <ProjectedMeshOutline
-                modelUrl={`${serverUrl}${modelUrl}`}
-                pose={pose}
+            
+            {/* Mask叠加 - 与图像完全对齐 */}
+            {frame.mask_url && maskOpacity > 0 && (
+              <img 
+                src={`${serverUrl}${frame.mask_url}`}
+                alt="Mask"
+                className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                style={{ opacity: maskOpacity * 0.6 }}
+              />
+            )}
+            
+            {/* Mesh投影 - nvdiffrast 渲染或凸包 */}
+            {showGhostWireframe && pose && intrinsics && (
+              useNvdiffrastRender && meshPath ? (
+                <RenderedMeshOverlay
+                  meshPath={meshPath}
+                  pose={pose}
+                  intrinsics={intrinsics}
+                  extrinsics={frame.camera_extrinsics}
+                  imageWidth={imageWidth}
+                  imageHeight={imageHeight}
+                  serverUrl={serverUrl}
+                  maskUrl={frame.mask_url ? `${serverUrl}${frame.mask_url}` : undefined}
+                  onIoUCalculated={handleIoUCalculated}
+                />
+              ) : (
+                <div className="absolute inset-0 w-full h-full pointer-events-none">
+                  <ProjectedMeshOutline
+                    modelUrl={`${serverUrl}${modelUrl}`}
+                    pose={pose}
+                    intrinsics={intrinsics}
+                    extrinsics={frame.camera_extrinsics}
+                    imageWidth={imageWidth}
+                    imageHeight={imageHeight}
+                    maskUrl={frame.mask_url ? `${serverUrl}${frame.mask_url}` : undefined}
+                    onIoUCalculated={handleIoUCalculated}
+                  />
+                </div>
+              )
+            )}
+            
+            {/* GT Bbox 投影可视化 - 已禁用 */}
+            {/* {currentInput?.gtBbox && intrinsics && (
+              <ProjectedBboxOverlay
+                gtBbox={currentInput.gtBbox}
                 intrinsics={intrinsics}
                 extrinsics={frame.camera_extrinsics}
                 imageWidth={imageWidth}
                 imageHeight={imageHeight}
-                maskUrl={frame.mask_url ? `${serverUrl}${frame.mask_url}` : undefined}
-                onIoUCalculated={handleIoUCalculated}
+              />
+            )} */}
+            
+            {/* 点标记 */}
+            <div className="absolute inset-0 w-full h-full pointer-events-none">
+              <PixelMarkerOverlay
+                width={imageWidth}
+                height={imageHeight}
+                frameId={frame.frame_id}
+                pointPairs={pointPairs}
+                pendingWorldPoint={pendingWorldPoint}
               />
             </div>
-          )}
-          
-          {/* 点标记 */}
-          <div className="absolute inset-0 w-full h-full pointer-events-none">
-            <PixelMarkerOverlay
-              width={imageWidth}
-              height={imageHeight}
-              frameId={frame.frame_id}
-              pointPairs={pointPairs}
-              pendingWorldPoint={pendingWorldPoint}
+            
+            {/* 透明点击层 - 直接绑定到图像上方 */}
+            <div 
+              className={`absolute top-0 left-0 right-0 bottom-0 ${isEnabled && isActive ? 'cursor-crosshair' : 'cursor-pointer'}`}
+              style={{ 
+                zIndex: 100,
+                touchAction: 'none'
+              }}
+              onClick={(e) => {
+                // 缩略图模式：点击图片区域也触发选中
+                if (!enlarged) {
+                  onSelect();
+                }
+                // 放大模式或已激活：处理标注点击
+                if (enlarged || (isEnabled && isActive)) {
+                  handleImageClick(e);
+                }
+              }}
             />
           </div>
-          
-          {/* 透明点击层 - 直接绑定到图像上方 */}
-          <div 
-            className={`absolute top-0 left-0 right-0 bottom-0 ${isEnabled && isActive ? 'cursor-crosshair' : 'cursor-pointer'}`}
-            style={{ 
-              zIndex: 100,
-              touchAction: 'none'
-            }}
-            onClick={(e) => {
-              // 缩略图模式：点击图片区域也触发选中
-              if (!enlarged) {
-                onSelect();
-              }
-              // 放大模式或已激活：处理标注点击
-              if (enlarged || (isEnabled && isActive)) {
-                handleImageClick(e);
-              }
-            }}
-          />
         </div>
-      </div>
+      )}
       
       {/* 禁用遮罩 */}
       {!isEnabled && (

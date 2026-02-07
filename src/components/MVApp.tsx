@@ -14,7 +14,7 @@ import { MVModelViewer } from './MVModelViewer';
 import { MVControlPanel } from './MVControlPanel';
 import { ToastContainer } from './ToastContainer';
 import { showGlobalToast } from '../hooks/useToast';
-import type { MVAnnotationInput, MVObjectItem, MVObjectData, BboxInfo } from '../types/multiview';
+import type { MVAnnotationInput, MVObjectItem, MVObjectData, BboxInfo, MeshInfo } from '../types/multiview';
 import type { Matrix4 } from '../types';
 
 // 数据服务器地址 - 使用相对路径，通过Vite代理转发
@@ -33,12 +33,17 @@ async function loadMVObjectData(sceneId: string, objectId: string, numFrames: nu
       return null;
     }
     
+    console.log('[loadMVObjectData] gt_bbox:', data.gt_bbox);
+    console.log('[loadMVObjectData] mesh_info:', data.mesh_info);
+    
     return {
       objectId: `${data.scene_id}_${data.object_id}`,
       meshUrl: data.mesh_url,
+      meshPath: data.mesh_path,
       frames: data.frames,
       initialPose: data.world_pose as Matrix4 | null,
-      gtBbox: data.gt_bbox as BboxInfo | null
+      gtBbox: data.gt_bbox as BboxInfo | null,
+      meshInfo: data.mesh_info as MeshInfo | null
     };
   } catch (e) {
     console.error('Failed to load MV object data:', e);
@@ -386,11 +391,13 @@ export function MVPoseAnnotationTool() {
                   key={`active-${activeFrameId}`}
                   frame={currentInput.frames.find(f => f.frame_id === activeFrameId)!}
                   modelUrl={currentInput.meshUrl}
+                  meshPath={currentInput.meshPath}
                   pose={currentPose ?? null}
                   isActive={true}
                   onSelect={() => {}}
                   serverUrl={MV_DATA_SERVER}
                   enlarged={true}
+                  splitView={true}
                 />
               </div>
             </div>
@@ -403,6 +410,7 @@ export function MVPoseAnnotationTool() {
                 key={frame.frame_id}
                 frame={frame}
                 modelUrl={currentInput.meshUrl}
+                meshPath={currentInput.meshPath}
                 pose={currentPose ?? null}
                 isActive={frame.frame_id === activeFrameId}
                 onSelect={() => setActiveFrameId(frame.frame_id)}

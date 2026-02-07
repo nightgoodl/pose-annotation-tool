@@ -22,7 +22,11 @@ npm install
 **2. Start the backend data server:**
 
 ```bash
-# For multi-view annotation
+# For multi-view annotation (需要 CUDA 环境用于 nvdiffrast 渲染)
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate sam3d-objects
+export CUDA_HOME=/usr/local/cuda-12.4
+cd pose-annotation-tool
 python server/data_server_mv.py 8084
 
 # For single-view annotation
@@ -73,6 +77,7 @@ pose-annotation-tool/
 ├── server/
 │   ├── data_server_mv.py          # Multi-view data API server
 │   ├── data_server.py             # Single-view data API server
+│   ├── render_service.py          # Nvdiffrast GPU rendering service
 │   └── mesh_decoder_service.py    # Mesh decoding service
 ├── index-mv.html                  # Multi-view HTML entry
 ├── index.html                     # Single-view HTML entry
@@ -132,6 +137,7 @@ MV_ALIGNED_ROOT = "/root/csz/data_partcrafter/LASA1M_ALIGNED_MV"
 | `/api/mv_objects` | GET | List all objects with pagination |
 | `/api/mv_object_data` | GET | Get object data (mesh, frames, cameras) |
 | `/api/save_mv_pose` | POST | Save annotated pose |
+| `/api/render_mesh` | POST | Render mesh with nvdiffrast (GPU) |
 | `/api/refresh_cache` | GET | Refresh object list cache |
 | `/data/mv_mesh/{scene}/{obj}/mesh.glb` | GET | Serve mesh file |
 | `/data/lasa1m/{scene}/{obj}/...` | GET | Serve LASA1M data files |
@@ -178,13 +184,46 @@ z_cam = depth
 P_world = RT @ [x_cam, y_cam, z_cam, 1]
 ```
 
+## Features
+
+### Multi-View Rendering
+
+- **GPU 加速渲染**: 使用 nvdiffrast 进行实时 GPU 渲染，替代传统的凸包投影
+- **渲染模式切换**: 控制面板中可切换 GPU 渲染和凸包渲染模式
+- **实时更新**: pose 变化时自动重新渲染
+- **IoU 计算**: 基于渲染的 alpha 通道计算与 GT mask 的 IoU
+
+### Rendering API
+
+`POST /api/render_mesh` 接受以下参数：
+
+```json
+{
+  "mesh_path": "/path/to/mesh.glb",
+  "pose": [[...], [...], [...], [...]],  // 4x4 object-to-world 矩阵
+  "intrinsics": {"fx": 500, "fy": 500, "cx": 320, "cy": 240},
+  "extrinsics": [[...], [...], [...], [...]],  // 4x4 camera-to-world 矩阵
+  "image_size": [480, 640]  // [H, W]
+}
+```
+
+返回 PNG 图像（RGBA，带 alpha 通道）。
+
 ## Dependencies
 
+### Frontend
 - React 18
 - Three.js + @react-three/fiber + @react-three/drei
 - Zustand (state management)
 - TailwindCSS (styling)
 - Lucide React (icons)
+
+### Backend
+- Python 3.11+
+- PyTorch with CUDA
+- nvdiffrast (GPU rasterization)
+- trimesh (mesh loading)
+- numpy
 
 ## Key Math Functions
 

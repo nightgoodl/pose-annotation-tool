@@ -10,11 +10,18 @@ import type {
   WorkflowState
 } from '../types';
 import type { 
-  MVAnnotationInput, 
-  MVPointPair, 
-  FrameData 
+  MVAnnotationInput,
+  FrameData,
+  MVPointPair
 } from '../types/multiview';
-import { solveUmeyama, solveUmeyamaRANSAC, identity4 } from '../utils/math';
+import { 
+  computeBboxAlignTransform, 
+  solveUmeyamaConstrained, 
+  solveUmeyamaConstrainedRANSAC, 
+  identity3,
+  identity4,
+  multiply4x4
+} from '../utils/math';
 
 interface MVAnnotationStore {
   // ========== 输入数据 ==========
@@ -66,15 +73,18 @@ interface MVAnnotationStore {
   averageIoU: number;
   setFrameIoU: (frameId: string, iou: number) => void;
   runAlignment: (useRANSAC?: boolean) => void;
+  applyBboxAlign: () => void;  // 应用纯 Bbox Align（不使用点对）
   resetAlignment: () => void;
   
   // ========== UI 状态 ==========
   isAnnotationEnabled: boolean;
   showGhostWireframe: boolean;
   maskOpacity: number;
+  useNvdiffrastRender: boolean;  // 使用 nvdiffrast GPU 渲染
   setAnnotationEnabled: (enabled: boolean) => void;
   setShowGhostWireframe: (show: boolean) => void;
   setMaskOpacity: (opacity: number) => void;
+  setUseNvdiffrastRender: (use: boolean) => void;
   
   // ========== 分类操作 ==========
   classifyAsValid: () => void;
@@ -94,6 +104,8 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
   // ========== 输入数据 ==========
   currentInput: null,
   setCurrentInput: (input) => {
+    console.log('[setCurrentInput] gtBbox:', input?.gtBbox);
+    console.log('[setCurrentInput] meshInfo:', input?.meshInfo);
     set({ 
       currentInput: input,
       activeFrameId: input?.frames[0]?.frame_id ?? null,
@@ -156,6 +168,12 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       pendingLocalPoint: null,
       pendingWorldPoint: null
     }));
+    
+    // 自动对齐：≥3 点时运行带约束 Umeyama
+    const state = get();
+    if (state.pointPairs.length >= 3) {
+      state.runAlignment(false);
+    }
   },
   
   removePointPair: (id) => {
@@ -244,23 +262,81 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     }
     
     // 使用所有帧的点对进行对齐
-    const srcPoints = state.pointPairs.map(p => p.localPoint);
+    // 注意：mesh 是 Y-up 的（Three.js 默认），世界坐标系是 Z-up 的
+    // 需要将 localPoint 从 Y-up 变换到 Z-up
+    // Y-up 到 Z-up 变换: x' = x, y' = -z, z' = y
+    const srcPoints = state.pointPairs.map(p => ({
+      x: p.localPoint.x,
+      y: -p.localPoint.z,  // Y-up 的 Z 变成 Z-up 的 -Y
+      z: p.localPoint.y    // Y-up 的 Y 变成 Z-up 的 Z
+    }));
     const dstPoints = state.pointPairs.map(p => p.worldPoint);
     
+    // 调试：输出所有点对（变换后）
+    console.log('[runAlignment] Point pairs (after Y-up to Z-up transform):');
+    state.pointPairs.forEach((p, i) => {
+      const src = srcPoints[i];
+      console.log(`  Pair ${i}: local_orig=(${p.localPoint.x.toFixed(3)}, ${p.localPoint.y.toFixed(3)}, ${p.localPoint.z.toFixed(3)}) -> local_zup=(${src.x.toFixed(3)}, ${src.y.toFixed(3)}, ${src.z.toFixed(3)}) -> world=(${p.worldPoint.x.toFixed(3)}, ${p.worldPoint.y.toFixed(3)}, ${p.worldPoint.z.toFixed(3)})`);
+    });
+    
+    // 调试：输出 GT bbox 信息
+    if (state.currentInput?.gtBbox) {
+      const gtBbox = state.currentInput.gtBbox;
+      console.log('[runAlignment] GT Bbox position:', gtBbox.position);
+      console.log('[runAlignment] GT Bbox scale:', gtBbox.scale);
+      if (gtBbox.corners) {
+        console.log('[runAlignment] GT Bbox corners (world coordinates):');
+        gtBbox.corners.forEach((c: number[], i: number) => {
+          console.log(`  Corner ${i}: (${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)})`);
+        });
+      }
+    }
+    
+    // 计算 baseRotation：直接使用 GT bbox 的 R 矩阵
+    // 这保证了最终结果是 GT bbox R + 4 个旋转角度之一（0°, 90°, 180°, 270°）
+    let baseRotation = identity3();
+    console.log('[runAlignment] gtBbox:', state.currentInput?.gtBbox);
+    
+    if (state.currentInput?.gtBbox?.R) {
+      // 直接使用 GT bbox 的 R 作为 baseRotation
+      const R = state.currentInput.gtBbox.R;
+      baseRotation = [
+        [R[0][0], R[0][1], R[0][2]],
+        [R[1][0], R[1][1], R[1][2]],
+        [R[2][0], R[2][1], R[2][2]]
+      ];
+      console.log('[runAlignment] 使用 gtBbox.R 作为 baseRotation');
+    } else {
+      console.log('[runAlignment] 无 gtBbox.R，使用单位旋转');
+    }
+    
+    // Y-up 到 Z-up 变换矩阵（用于最终变换矩阵）
+    // 因为 mesh 渲染时是 Y-up 的，所以最终变换矩阵需要包含这个变换
+    // dst = R * S * R_yup_to_zup * src_yup + t
+    const R_yup_to_zup: Matrix4 = [
+      [1, 0, 0, 0],
+      [0, 0, -1, 0],
+      [0, 1, 0, 0],
+      [0, 0, 0, 1]
+    ];
+    
     if (useRANSAC && state.pointPairs.length >= 5) {
-      // 使用 RANSAC 进行鲁棒对齐
-      const result = solveUmeyamaRANSAC(srcPoints, dstPoints, {
+      // RANSAC + 带约束 Umeyama（手动触发）
+      const result = solveUmeyamaConstrainedRANSAC(srcPoints, dstPoints, baseRotation, {
         maxIterations: 100,
         inlierThreshold: 0.05  // 5cm 阈值
       });
       
+      // 最终变换矩阵 = result.transformMatrix * R_yup_to_zup
+      const finalTransform = multiply4x4(result.transformMatrix, R_yup_to_zup);
+      
       set({
-        calculatedPose: result.transformMatrix,
+        calculatedPose: finalTransform,
         calculatedScale: result.scale,
         alignmentError: result.error
       });
       
-      console.log('MV Alignment (RANSAC) result:', {
+      console.log('MV Alignment (Constrained RANSAC) result:', {
         numPoints: state.pointPairs.length,
         numFrames: new Set(state.pointPairs.map(p => p.frame_id)).size,
         inliers: result.inlierIndices.length,
@@ -269,24 +345,46 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
         error: result.error
       });
     } else {
-      // 使用普通 Umeyama
-      const result = solveUmeyama(srcPoints, dstPoints);
+      // 普通带约束 Umeyama（自动触发）
+      const result = solveUmeyamaConstrained(srcPoints, dstPoints, baseRotation);
+      
+      // 最终变换矩阵 = result.transformMatrix * R_yup_to_zup
+      const finalTransform = multiply4x4(result.transformMatrix, R_yup_to_zup);
       
       set({
-        calculatedPose: result.transformMatrix,
+        calculatedPose: finalTransform,
         calculatedScale: result.scale,
         alignmentError: result.error
       });
       
-      console.log('MV Alignment result:', {
+      console.log('MV Alignment (Constrained) result:', {
         numPoints: state.pointPairs.length,
         numFrames: new Set(state.pointPairs.map(p => p.frame_id)).size,
         scale: result.scale,
-        error: result.error,
-        rotation: result.rotation,
-        translation: result.translation
+        error: result.error
       });
     }
+  },
+  
+  applyBboxAlign: () => {
+    const state = get();
+    if (!state.currentInput?.meshInfo || !state.currentInput?.gtBbox) {
+      console.warn('[applyBboxAlign] 需要 meshInfo 和 gtBbox');
+      return;
+    }
+    
+    const bboxAlignPose = computeBboxAlignTransform(
+      state.currentInput.meshInfo,
+      state.currentInput.gtBbox
+    );
+    
+    set({
+      calculatedPose: bboxAlignPose,
+      calculatedScale: 1,  // scale 已经包含在 transform 中
+      alignmentError: 0
+    });
+    
+    console.log('[applyBboxAlign] 应用纯 Bbox Align 变换');
   },
   
   resetAlignment: () => {
@@ -309,8 +407,10 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
   isAnnotationEnabled: false,
   showGhostWireframe: true,
   maskOpacity: 0.5,
+  useNvdiffrastRender: true,  // 默认使用 nvdiffrast 渲染
   
   setAnnotationEnabled: (enabled) => set({ isAnnotationEnabled: enabled }),
+  setUseNvdiffrastRender: (use) => set({ useNvdiffrastRender: use }),
   setShowGhostWireframe: (show) => set({ showGhostWireframe: show }),
   setMaskOpacity: (opacity) => set({ maskOpacity: opacity }),
   
@@ -424,7 +524,8 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       alignmentError: 0,
       isAnnotationEnabled: false,
       showGhostWireframe: true,
-      maskOpacity: 0.5
+      maskOpacity: 0.5,
+      useNvdiffrastRender: true
     });
   }
 }));

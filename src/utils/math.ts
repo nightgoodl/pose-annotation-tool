@@ -850,3 +850,539 @@ export function buildProjectionMatrix(
     [0, 0, -1, 0]
   ];
 }
+
+// ============== 带约束 Umeyama 算法 ==============
+
+/**
+ * 绕 Z 轴的旋转矩阵
+ */
+export function rotationMatrixZ(angle: number): Matrix3 {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  return [
+    [c, -s, 0],
+    [s,  c, 0],
+    [0,  0, 1]
+  ];
+}
+
+/**
+ * 从 mesh extent 和 GT bbox 计算 baseRotation
+ * 基于 XY 平面的长短边对齐，绕 Z 轴旋转
+ * 
+ * @param meshExtent mesh 的 extent [ex, ey, ez]
+ * @param gtBbox GT bbox 信息
+ * @returns baseRotation (3x3)
+ */
+export function computeBboxBaseRotation(
+  meshExtent: [number, number, number],
+  gtBbox: { position: [number, number, number]; scale: [number, number, number]; R?: number[][] }
+): Matrix3 {
+  // 如果没有 R 矩阵，返回单位矩阵
+  if (!gtBbox.R) {
+    return identity3();
+  }
+  
+  const gtR = gtBbox.R;
+  const gtScale = gtBbox.scale;
+  const gtExtent: [number, number, number] = [gtScale[0] * 2, gtScale[1] * 2, gtScale[2] * 2];
+  
+  // 过滤出主要在 XY 平面的轴（Z 分量小于 XY 分量）
+  const gtEdgesXYDominant: { length: number; direction: number[]; index: number }[] = [];
+  for (let i = 0; i < 3; i++) {
+    const direction = [gtR[0][i], gtR[1][i], gtR[2][i]];
+    const length = gtExtent[i];
+    
+    const zComponent = Math.abs(direction[2]);
+    const xyComponent = Math.sqrt(direction[0] * direction[0] + direction[1] * direction[1]);
+    
+    if (xyComponent > zComponent) {
+      const xyProjectionLength = length * xyComponent;
+      gtEdgesXYDominant.push({ length: xyProjectionLength, direction, index: i });
+    }
+  }
+  
+  // 如果没有主要在 XY 平面的轴，返回单位矩阵
+  if (gtEdgesXYDominant.length < 2) {
+    return identity3();
+  }
+  
+  // 按 XY 平面投影长度排序（从大到小）
+  gtEdgesXYDominant.sort((a, b) => b.length - a.length);
+  
+  const gtLongestXYLen = gtEdgesXYDominant[0].length;
+  const gtSecondXYLen = gtEdgesXYDominant[1].length;
+  const gtXYRatio = gtLongestXYLen / (gtSecondXYLen + 1e-6);
+  
+  // Mesh 在 XY 平面的长短边
+  const meshXLength = meshExtent[0];
+  const meshYLength = meshExtent[1];
+  const meshXYRatio = Math.max(meshXLength, meshYLength) / (Math.min(meshXLength, meshYLength) + 1e-6);
+  
+  // 只有当长短边都足够明显时才旋转（阈值：长短比 > 1.2）
+  if (gtXYRatio <= 1.2 || meshXYRatio <= 1.2) {
+    return identity3();
+  }
+  
+  // GT bbox 在 XY 平面的最长边方向
+  const gtLongestDirection = gtEdgesXYDominant[0].direction;
+  const gtLongestXY = [gtLongestDirection[0], gtLongestDirection[1]];
+  const gtLongestXYNorm = Math.sqrt(gtLongestXY[0] * gtLongestXY[0] + gtLongestXY[1] * gtLongestXY[1]);
+  gtLongestXY[0] /= gtLongestXYNorm + 1e-6;
+  gtLongestXY[1] /= gtLongestXYNorm + 1e-6;
+  
+  // Mesh 在 XY 平面的最长边方向
+  const meshLongestXY = meshXLength > meshYLength ? [1, 0] : [0, 1];
+  
+  // 计算需要旋转的角度（绕 Z 轴）
+  const gtAngle = Math.atan2(gtLongestXY[1], gtLongestXY[0]);
+  const meshAngle = Math.atan2(meshLongestXY[1], meshLongestXY[0]);
+  const rotationAngle = gtAngle - meshAngle;
+  
+  // 只有当旋转角度显著时才旋转（大于 10 度）
+  if (Math.abs(rotationAngle) <= Math.PI / 18) {
+    return identity3();
+  }
+  
+  return rotationMatrixZ(rotationAngle);
+}
+
+/**
+ * 计算纯 Bbox Align 变换矩阵（只使用 bbox 信息，不使用点对）
+ * 
+ * 核心目标：让变换后的 mesh 边与 GT bbox 边平行（使用 GT bbox 的旋转矩阵 R）
+ * 
+ * 步骤：
+ * 1. 直接使用 GT bbox 的旋转矩阵 R（保证边边平行）
+ * 2. 计算 scale（使用对角线比例）
+ * 3. 计算 translation（mesh 中心对齐 GT bbox 中心）
+ * 
+ * @param meshInfo mesh 信息 { center, extent }
+ * @param gtBbox GT bbox 信息 { position, scale, R, corners }
+ * @returns 4x4 变换矩阵
+ */
+export function computeBboxAlignTransform(
+  meshInfo: { center: [number, number, number]; extent: [number, number, number] },
+  gtBbox: { position: [number, number, number]; scale: [number, number, number]; R?: number[][]; corners?: number[][] }
+): Matrix4 {
+  // 注意：前端 MVFrameView.tsx 中有 MESH_SCALE = 2.0 的硬编码
+  const MESH_SCALE = 2.0;
+  
+  // 考虑 MESH_SCALE 后的 mesh 信息
+  const scaledMeshCenter: [number, number, number] = [
+    meshInfo.center[0] * MESH_SCALE,
+    meshInfo.center[1] * MESH_SCALE,
+    meshInfo.center[2] * MESH_SCALE
+  ];
+  const scaledMeshExtent: [number, number, number] = [
+    meshInfo.extent[0] * MESH_SCALE,
+    meshInfo.extent[1] * MESH_SCALE,
+    meshInfo.extent[2] * MESH_SCALE
+  ];
+  
+  // 计算 GT bbox 的 extent（优先从 corners 计算）
+  let gtExtent: [number, number, number];
+  let gtCenter: [number, number, number];
+  
+  if (gtBbox.corners && gtBbox.corners.length === 8) {
+    // 从 corners 计算 extent 和 center
+    const corners = gtBbox.corners;
+    const min = [
+      Math.min(...corners.map(c => c[0])),
+      Math.min(...corners.map(c => c[1])),
+      Math.min(...corners.map(c => c[2]))
+    ];
+    const max = [
+      Math.max(...corners.map(c => c[0])),
+      Math.max(...corners.map(c => c[1])),
+      Math.max(...corners.map(c => c[2]))
+    ];
+    gtExtent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    gtCenter = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+    console.log('[computeBboxAlignTransform] 使用 corners 计算 extent:', gtExtent);
+  } else {
+    // fallback: 使用 scale * 2（可能不准确）
+    gtExtent = [gtBbox.scale[0] * 2, gtBbox.scale[1] * 2, gtBbox.scale[2] * 2];
+    gtCenter = gtBbox.position;
+    console.log('[computeBboxAlignTransform] 警告: 使用 scale*2 计算 extent (可能不准确)');
+  }
+  
+  // 1. 直接使用 GT bbox 的旋转矩阵 R（保证边边平行）
+  // GT bbox 的 R 矩阵定义了其局部坐标系在世界坐标系中的方向
+  const gtR: Matrix3 = gtBbox.R ? [
+    [gtBbox.R[0][0], gtBbox.R[0][1], gtBbox.R[0][2]],
+    [gtBbox.R[1][0], gtBbox.R[1][1], gtBbox.R[1][2]],
+    [gtBbox.R[2][0], gtBbox.R[2][1], gtBbox.R[2][2]]
+  ] : identity3();
+  
+  console.log('[computeBboxAlignTransform] 使用 GT bbox R 矩阵:', gtR);
+  
+  // 2. 将 mesh extent 变换到 GT bbox 的局部坐标系
+  // 在 GT bbox 的局部坐标系中计算各向异性 scale
+  // 注意：这里假设 mesh 的 AABB 轴与世界坐标系对齐
+  // 需要将 mesh extent 投影到 GT bbox 的局部坐标系
+  
+  // 简化处理：使用对角线比例作为各向同性 scale
+  // 因为 mesh 的 AABB 轴向和 GT bbox 的轴向不一定对齐
+  const meshDiagonal = Math.sqrt(
+    scaledMeshExtent[0] ** 2 + scaledMeshExtent[1] ** 2 + scaledMeshExtent[2] ** 2
+  );
+  const gtDiagonal = Math.sqrt(gtExtent[0] ** 2 + gtExtent[1] ** 2 + gtExtent[2] ** 2);
+  const scale = gtDiagonal / (meshDiagonal + 1e-6);
+  
+  console.log('[computeBboxAlignTransform] 使用各向同性 scale:', scale);
+  
+  // 3. 变换公式: P_world = scale * gtR * P_mesh + t
+  // 这是各向同性缩放，保证边边平行
+  
+  console.log('[computeBboxAlignTransform] gtExtent:', gtExtent, 'scale:', scale);
+  
+  // 5. Y-up 到 Z-up 变换矩阵
+  // mesh 是 Y-up 的（Three.js 默认），世界坐标系是 Z-up 的
+  // R_yup_to_zup: x' = x, y' = -z, z' = y
+  const R_yup_to_zup: Matrix3 = [
+    [1, 0, 0],
+    [0, 0, -1],
+    [0, 1, 0]
+  ];
+  
+  // 6. 构建组合旋转矩阵: gtR * R_yup_to_zup
+  const combinedR = multiply3x3(gtR, R_yup_to_zup);
+  
+  // 7. 重新计算 translation（使用组合旋转矩阵）
+  // 让 mesh 中心对齐 GT bbox 中心: gtCenter = scale * combinedR * meshCenter + t
+  // 所以: t = gtCenter - scale * combinedR * meshCenter
+  const rotatedCenterCombined = multiplyMat3Vec3(combinedR, scaledMeshCenter);
+  const translationCombined: Vector3 = [
+    gtCenter[0] - scale * rotatedCenterCombined[0],
+    gtCenter[1] - scale * rotatedCenterCombined[1],
+    gtCenter[2] - scale * rotatedCenterCombined[2]
+  ];
+  
+  console.log('[computeBboxAlignTransform] combinedR (gtR * R_yup_to_zup):', combinedR);
+  console.log('[computeBboxAlignTransform] translationCombined:', translationCombined);
+  
+  // 8. 构建 4x4 变换矩阵: [scale * combinedR | t]
+  const transformMatrix: Matrix4 = [
+    [scale * combinedR[0][0], scale * combinedR[0][1], scale * combinedR[0][2], translationCombined[0]],
+    [scale * combinedR[1][0], scale * combinedR[1][1], scale * combinedR[1][2], translationCombined[1]],
+    [scale * combinedR[2][0], scale * combinedR[2][1], scale * combinedR[2][2], translationCombined[2]],
+    [0, 0, 0, 1]
+  ];
+  
+  return transformMatrix;
+}
+
+/**
+ * 固定旋转矩阵 R，求解最优各向异性 scale 和 translation
+ * 
+ * 变换公式: dst = R * diag(sx, sy, sz) * src + t
+ * 
+ * 这里 S 是在 mesh 的局部坐标系（src 坐标系）中的缩放
+ * R * S 不是正交矩阵，但这是实现各向异性缩放的正确方式
+ * 
+ * 求解方法：
+ * 令 y = R^T * dst, x = src
+ * 则 y = S * x + R^T * t = S * x + t'
+ * 对每个轴分别求解 scale
+ * 
+ * @returns { scale, scaleVec, translation, error, transformMatrix }
+ */
+export function solveScaleTranslationForFixedR(
+  srcPoints: Point3D[],
+  dstPoints: Point3D[],
+  R: Matrix3
+): { scale: number; scaleVec: Vector3; translation: Vector3; error: number; transformMatrix: Matrix4 } {
+  const n = srcPoints.length;
+  
+  if (n < 1) {
+    return {
+      scale: 1,
+      scaleVec: [1, 1, 1],
+      translation: [0, 0, 0],
+      error: Infinity,
+      transformMatrix: identity4()
+    };
+  }
+  
+  // 1. 将 dst 点变换到 R 的局部坐标系: y = R^T * dst
+  const yPoints: Vector3[] = [];
+  for (let i = 0; i < n; i++) {
+    const dst: Vector3 = [dstPoints[i].x, dstPoints[i].y, dstPoints[i].z];
+    // R^T * dst
+    yPoints.push([
+      R[0][0] * dst[0] + R[1][0] * dst[1] + R[2][0] * dst[2],
+      R[0][1] * dst[0] + R[1][1] * dst[1] + R[2][1] * dst[2],
+      R[0][2] * dst[0] + R[1][2] * dst[1] + R[2][2] * dst[2]
+    ]);
+  }
+  
+  // 2. src 点保持原样: x = src
+  const xPoints: Vector3[] = [];
+  for (let i = 0; i < n; i++) {
+    xPoints.push([srcPoints[i].x, srcPoints[i].y, srcPoints[i].z]);
+  }
+  
+  // 3. 计算质心
+  const xCentroid: Vector3 = [0, 0, 0];
+  const yCentroid: Vector3 = [0, 0, 0];
+  
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      xCentroid[k] += xPoints[i][k];
+      yCentroid[k] += yPoints[i][k];
+    }
+  }
+  for (let k = 0; k < 3; k++) {
+    xCentroid[k] /= n;
+    yCentroid[k] /= n;
+  }
+  
+  // 4. 去中心化
+  const xCentered: Vector3[] = [];
+  const yCentered: Vector3[] = [];
+  
+  for (let i = 0; i < n; i++) {
+    xCentered.push([
+      xPoints[i][0] - xCentroid[0],
+      xPoints[i][1] - xCentroid[1],
+      xPoints[i][2] - xCentroid[2]
+    ]);
+    yCentered.push([
+      yPoints[i][0] - yCentroid[0],
+      yPoints[i][1] - yCentroid[1],
+      yPoints[i][2] - yCentroid[2]
+    ]);
+  }
+  
+  // 5. 对每个轴求解 scale: y[k] = s[k] * x[k]
+  // 最小二乘: s[k] = Σ(y[k] * x[k]) / Σ(x[k]²)
+  const numerators: Vector3 = [0, 0, 0];
+  const denominators: Vector3 = [0, 0, 0];
+  
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      numerators[k] += yCentered[i][k] * xCentered[i][k];
+      denominators[k] += xCentered[i][k] * xCentered[i][k];
+    }
+  }
+  
+  const scaleVec: Vector3 = [
+    denominators[0] > 1e-10 ? numerators[0] / denominators[0] : 1,
+    denominators[1] > 1e-10 ? numerators[1] / denominators[1] : 1,
+    denominators[2] > 1e-10 ? numerators[2] / denominators[2] : 1
+  ];
+  
+  // 6. 计算 t' = yCentroid - S * xCentroid（在 R 的局部坐标系中）
+  const tLocal: Vector3 = [
+    yCentroid[0] - scaleVec[0] * xCentroid[0],
+    yCentroid[1] - scaleVec[1] * xCentroid[1],
+    yCentroid[2] - scaleVec[2] * xCentroid[2]
+  ];
+  
+  // 7. 变换回世界坐标系: t = R * t'
+  const translation: Vector3 = multiplyMat3Vec3(R, tLocal);
+  
+  // 8. 构建 RS = R * S 矩阵
+  // RS[i][j] = R[i][j] * S[j] = R[i][j] * scaleVec[j]
+  const RS: Matrix3 = [
+    [R[0][0] * scaleVec[0], R[0][1] * scaleVec[1], R[0][2] * scaleVec[2]],
+    [R[1][0] * scaleVec[0], R[1][1] * scaleVec[1], R[1][2] * scaleVec[2]],
+    [R[2][0] * scaleVec[0], R[2][1] * scaleVec[1], R[2][2] * scaleVec[2]]
+  ];
+  
+  // 9. 构建变换矩阵: [RS | t]
+  const transformMatrix: Matrix4 = [
+    [RS[0][0], RS[0][1], RS[0][2], translation[0]],
+    [RS[1][0], RS[1][1], RS[1][2], translation[1]],
+    [RS[2][0], RS[2][1], RS[2][2], translation[2]],
+    [0, 0, 0, 1]
+  ];
+  
+  // 10. 计算误差
+  let error = 0;
+  for (let i = 0; i < n; i++) {
+    const transformed = transformPoint(transformMatrix, srcPoints[i]);
+    const dx = transformed.x - dstPoints[i].x;
+    const dy = transformed.y - dstPoints[i].y;
+    const dz = transformed.z - dstPoints[i].z;
+    error += dx * dx + dy * dy + dz * dz;
+  }
+  error = Math.sqrt(error / n);
+  
+  const scale = (scaleVec[0] + scaleVec[1] + scaleVec[2]) / 3;
+  
+  console.log(`[solveScaleTranslationForFixedR] scaleVec=[${scaleVec.map(v => v.toFixed(4)).join(', ')}], error=${error.toFixed(4)}`);
+  console.log(`[solveScaleTranslationForFixedR] xCentroid=[${xCentroid.map(v => v.toFixed(3)).join(', ')}]`);
+  console.log(`[solveScaleTranslationForFixedR] yCentroid=[${yCentroid.map(v => v.toFixed(3)).join(', ')}]`);
+  console.log(`[solveScaleTranslationForFixedR] translation=[${translation.map(v => v.toFixed(3)).join(', ')}]`);
+  
+  // 调试：输出每个点的误差
+  for (let i = 0; i < Math.min(n, 3); i++) {
+    const transformed = transformPoint(transformMatrix, srcPoints[i]);
+    console.log(`  Point ${i}: src=(${srcPoints[i].x.toFixed(3)}, ${srcPoints[i].y.toFixed(3)}, ${srcPoints[i].z.toFixed(3)}) -> (${transformed.x.toFixed(3)}, ${transformed.y.toFixed(3)}, ${transformed.z.toFixed(3)}), dst=(${dstPoints[i].x.toFixed(3)}, ${dstPoints[i].y.toFixed(3)}, ${dstPoints[i].z.toFixed(3)})`);
+  }
+  
+  return { scale, scaleVec, translation, error, transformMatrix };
+}
+
+/**
+ * 带约束的 Umeyama 算法
+ * 测试 4 个角度 [0°, 90°, 180°, 270°]，固定 R 求解 s, t
+ * 
+ * @param srcPoints 源点集 (模型空间局部坐标)
+ * @param dstPoints 目标点集 (世界空间坐标)
+ * @param baseRotation 基础旋转矩阵（从 Bbox Align 计算）
+ * @returns 最佳对齐结果
+ */
+export function solveUmeyamaConstrained(
+  srcPoints: Point3D[],
+  dstPoints: Point3D[],
+  baseRotation: Matrix3
+): UmeyamaResult {
+  const n = srcPoints.length;
+  
+  if (n < 3) {
+    console.warn('Constrained Umeyama requires at least 3 point pairs');
+    return {
+      rotation: identity3(),
+      translation: [0, 0, 0],
+      scale: 1,
+      transformMatrix: identity4(),
+      error: Infinity
+    };
+  }
+  
+  // 测试 4 个角度
+  const angles = [0, Math.PI / 2, Math.PI, 3 * Math.PI / 2];
+  let bestResult: { scale: number; scaleVec: Vector3; translation: Vector3; error: number; transformMatrix: Matrix4 } | null = null;
+  let bestRotation: Matrix3 = identity3();
+  let bestError = Infinity;
+  
+  console.log('[Constrained Umeyama] baseRotation:', baseRotation);
+  
+  for (const angle of angles) {
+    // R_test = baseRotation * rotZ（先绕 mesh 的 Z 轴旋转，再应用 GT bbox 的 R）
+    const rotZ = rotationMatrixZ(angle);
+    const R_test = multiply3x3(baseRotation, rotZ);
+    
+    // 固定 R_test，求解 s, t
+    const result = solveScaleTranslationForFixedR(srcPoints, dstPoints, R_test);
+    
+    console.log(`[Constrained Umeyama] angle=${(angle * 180 / Math.PI).toFixed(0)}°, scaleVec=[${result.scaleVec.map(v => v.toFixed(4)).join(', ')}], error=${result.error.toFixed(4)}`);
+    
+    if (result.error < bestError) {
+      bestError = result.error;
+      bestResult = result;
+      bestRotation = R_test;
+    }
+  }
+  
+  if (!bestResult) {
+    return solveUmeyama(srcPoints, dstPoints);
+  }
+  
+  console.log('[Constrained Umeyama] best angle error:', bestError.toFixed(4));
+  
+  return {
+    rotation: bestRotation,
+    translation: bestResult.translation,
+    scale: bestResult.scale,
+    transformMatrix: bestResult.transformMatrix,
+    error: bestResult.error
+  };
+}
+
+/**
+ * RANSAC + 带约束 Umeyama 算法
+ */
+export function solveUmeyamaConstrainedRANSAC(
+  srcPoints: Point3D[],
+  dstPoints: Point3D[],
+  baseRotation: Matrix3,
+  options: {
+    maxIterations?: number;
+    inlierThreshold?: number;
+  } = {}
+): UmeyamaResult & { inlierIndices: number[]; outlierIndices: number[] } {
+  const n = srcPoints.length;
+  const maxIterations = options.maxIterations ?? 100;
+  const inlierThreshold = options.inlierThreshold ?? 0.05;
+  
+  if (n < 3) {
+    return {
+      ...solveUmeyamaConstrained(srcPoints, dstPoints, baseRotation),
+      inlierIndices: [],
+      outlierIndices: Array.from({ length: n }, (_, i) => i)
+    };
+  }
+  
+  if (n <= 4) {
+    const result = solveUmeyamaConstrained(srcPoints, dstPoints, baseRotation);
+    return {
+      ...result,
+      inlierIndices: Array.from({ length: n }, (_, i) => i),
+      outlierIndices: []
+    };
+  }
+  
+  let bestResult: UmeyamaResult | null = null;
+  let bestInliers: number[] = [];
+  let bestError = Infinity;
+  
+  for (let iter = 0; iter < maxIterations; iter++) {
+    // 随机选择 3 个点
+    const sampleIndices = randomSample(n, 3);
+    const sampleSrc = sampleIndices.map(i => srcPoints[i]);
+    const sampleDst = sampleIndices.map(i => dstPoints[i]);
+    
+    // 用样本点计算带约束变换
+    const candidateResult = solveUmeyamaConstrained(sampleSrc, sampleDst, baseRotation);
+    
+    // 计算所有点的误差，找内点
+    const inliers: number[] = [];
+    let totalError = 0;
+    
+    for (let i = 0; i < n; i++) {
+      const transformed = transformPoint(candidateResult.transformMatrix, srcPoints[i]);
+      const dx = transformed.x - dstPoints[i].x;
+      const dy = transformed.y - dstPoints[i].y;
+      const dz = transformed.z - dstPoints[i].z;
+      const error = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      
+      if (error < inlierThreshold) {
+        inliers.push(i);
+        totalError += error;
+      }
+    }
+    
+    if (inliers.length > bestInliers.length ||
+        (inliers.length === bestInliers.length && totalError < bestError)) {
+      bestInliers = inliers;
+      bestError = totalError;
+      bestResult = candidateResult;
+    }
+    
+    if (inliers.length / n >= 0.9) {
+      break;
+    }
+  }
+  
+  // 用所有内点重新计算
+  if (bestInliers.length >= 3) {
+    const inlierSrc = bestInliers.map(i => srcPoints[i]);
+    const inlierDst = bestInliers.map(i => dstPoints[i]);
+    bestResult = solveUmeyamaConstrained(inlierSrc, inlierDst, baseRotation);
+  }
+  
+  const outlierIndices = Array.from({ length: n }, (_, i) => i)
+    .filter(i => !bestInliers.includes(i));
+  
+  console.log(`[Constrained RANSAC] 内点: ${bestInliers.length}/${n}, 离群点: ${outlierIndices.length}`);
+  
+  return {
+    ...(bestResult ?? solveUmeyamaConstrained(srcPoints, dstPoints, baseRotation)),
+    inlierIndices: bestInliers,
+    outlierIndices
+  };
+}
