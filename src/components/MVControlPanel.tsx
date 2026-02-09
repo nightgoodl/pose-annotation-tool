@@ -14,6 +14,7 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
   const pointPairs = useMVAnnotationStore((state) => state.pointPairs);
   
   const resetAlignment = useMVAnnotationStore((state) => state.resetAlignment);
+  const runAlignment = useMVAnnotationStore((state) => state.runAlignment);
   const isSavingNext = useMVAnnotationStore((state) => state.isSavingNext);
   const remainingCount = useMVAnnotationStore((state) => state.remainingCount);
   
@@ -27,7 +28,7 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
       {/* 点数提示 */}
       {workflowState === 'annotation' && (
         <div className="text-xs text-gray-500 text-center">
-          点数: {pointPairs.length}{pointPairs.length >= 5 ? ' (RANSAC自动对齐)' : pointPairs.length >= 3 ? ' (自动对齐)' : ''}
+          点数: {pointPairs.length}{pointPairs.length >= 3 ? ' (自动对齐)' : ''}
         </div>
       )}
       
@@ -44,6 +45,19 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
               重置关键点 ({pointPairs.length})
             </button>
           )}
+          
+          {/* RANSAC 对齐（手动触发，≥5点可用） */}
+          <button
+            onClick={() => runAlignment(true)}
+            disabled={isSavingNext || pointPairs.length < 5}
+            className={`w-full px-4 py-2 rounded font-medium transition-colors ${
+              isSavingNext || pointPairs.length < 5
+                ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                : 'bg-blue-700 hover:bg-blue-600 text-white'
+            }`}
+          >
+            RANSAC 对齐{pointPairs.length < 5 ? ` (需${5 - pointPairs.length}点)` : ''}
+          </button>
           
           {/* 保存并处理下一个 - 需要>=3点 */}
           {onSaveAndNext && (

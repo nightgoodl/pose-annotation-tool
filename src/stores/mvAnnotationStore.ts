@@ -182,11 +182,9 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       pendingWorldPoint: null
     }));
     
-    // 自动对齐：≥5 点时用 RANSAC，3-4 点时用普通对齐
+    // 自动对齐：≥3 点时用普通 Umeyama（RANSAC 需手动触发）
     const state = get();
-    if (state.pointPairs.length >= 5) {
-      state.runAlignment(true);
-    } else if (state.pointPairs.length >= 3) {
+    if (state.pointPairs.length >= 3) {
       state.runAlignment(false);
     }
   },
