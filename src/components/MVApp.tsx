@@ -416,6 +416,31 @@ export function MVPoseAnnotationTool() {
     setCurrentInput(data);
   }, [setCurrentInput]);
   
+  // 预加载：当进入标注页面后，后台预热下一个物体的数据
+  useEffect(() => {
+    if (!currentInput) return;
+    
+    const parts = currentInput.objectId.split('_');
+    const sceneId = parts[0];
+    const objectId = parts.slice(1).join('_');
+    
+    // 延迟1秒后开始预加载，避免与当前加载竞争
+    const timer = setTimeout(async () => {
+      try {
+        const nextTask = await fetchNextMVTask(sceneId, objectId);
+        if (nextTask.success && nextTask.has_next && nextTask.data) {
+          // 触发后端预加载（不等待结果）
+          fetch(`${MV_DATA_SERVER}/api/preload?scene_id=${nextTask.data.scene_id}&object_id=${nextTask.data.object_id}&num_frames=${numFrames}`).catch(() => {});
+          console.log(`[preload] 预加载下一个: ${nextTask.data.scene_id}/${nextTask.data.object_id}`);
+        }
+      } catch {
+        // 预加载失败不影响使用
+      }
+    }, 1000);
+    
+    return () => clearTimeout(timer);
+  }, [currentInput, numFrames]);
+  
   const handleBack = useCallback(() => {
     // 如果有保存的分类信息，传递给数据选择器
     // 注意：保存时会自动将非invalid的category设置为fixed

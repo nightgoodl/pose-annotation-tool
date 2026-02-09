@@ -1009,9 +1009,9 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
         // 分屏模式：左侧原图，右侧渲染预览
         <div className="flex gap-2 p-2">
           {/* 左侧：原图 */}
-          <div className="flex-1 flex flex-col">
+          <div className="flex-1 flex flex-col items-center">
             <div className="text-center text-sm text-gray-400 mb-1">原图</div>
-            <div className="relative" style={{ display: 'inline-block' }}>
+            <div className="relative" style={{ width: 'fit-content' }}>
               {/* 主图像 */}
               <img
                 src={`${serverUrl}${frame.rgb_url}`}
@@ -1029,7 +1029,7 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
                 <img 
                   src={`${serverUrl}${frame.mask_url}`}
                   alt="Mask"
-                  className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                  className="absolute inset-0 w-full h-full pointer-events-none"
                   style={{ opacity: maskOpacity * 0.6 }}
                 />
               )}
@@ -1062,9 +1062,9 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
           </div>
           
           {/* 右侧：渲染预览 */}
-          <div className="flex-1 flex flex-col">
+          <div className="flex-1 flex flex-col items-center">
             <div className="text-center text-sm text-gray-400 mb-1">渲染预览</div>
-            <div className="relative" style={{ display: 'inline-block' }}>
+            <div className="relative" style={{ width: 'fit-content' }}>
               {/* 主图像 */}
               <img
                 src={`${serverUrl}${frame.rgb_url}`}
@@ -1078,7 +1078,7 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
                 <img 
                   src={`${serverUrl}${frame.mask_url}`}
                   alt="Mask"
-                  className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                  className="absolute inset-0 w-full h-full pointer-events-none"
                   style={{ opacity: maskOpacity * 0.6 }}
                 />
               )}
@@ -1130,7 +1130,7 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
         // 原有的单图显示模式
         <div className={`${enlarged ? 'flex items-center justify-center p-2' : ''}`}>
           {/* 图像包装器 - 确保叠加层与图像对齐 */}
-          <div className="relative" style={{ display: 'inline-block' }}>
+          <div className="relative" style={{ width: enlarged ? 'fit-content' : '100%' }}>
             {/* 主图像 - 底层 */}
             <img
               src={`${serverUrl}${frame.rgb_url}`}
@@ -1148,7 +1148,7 @@ export function MVFrameView({ frame, modelUrl, meshPath, pose, isActive, onSelec
               <img 
                 src={`${serverUrl}${frame.mask_url}`}
                 alt="Mask"
-                className="absolute inset-0 w-full h-full pointer-events-none object-contain"
+                className="absolute inset-0 w-full h-full pointer-events-none"
                 style={{ opacity: maskOpacity * 0.6 }}
               />
             )}
