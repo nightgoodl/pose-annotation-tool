@@ -39,6 +39,16 @@ _mv_objects_cache = None
 _mv_objects_cache_time = 0
 CACHE_TTL = 300  # 缓存有效期5分钟
 
+# 物体数据缓存 (load_mv_object_data 结果)
+from collections import OrderedDict
+_object_data_cache = OrderedDict()  # key: "scene_id/object_id/num_frames" -> data dict
+_OBJECT_DATA_CACHE_MAX = 50  # 最多缓存50个物体
+
+# 场景级缓存
+_instances_cache = {}  # key: scene_id -> instances list
+_mesh_info_cache = {}  # key: "scene_id/object_id" -> mesh_info dict
+_image_size_cache = {}  # key: image_path -> (width, height)
+
 
 class MVDataAPIHandler(SimpleHTTPRequestHandler):
     """多视角数据API处理器"""
@@ -84,6 +94,12 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             object_id = query.get('object_id', [None])[0]
             num_frames = int(query.get('num_frames', [8])[0])
             self.handle_get_mv_object_data(scene_id, object_id, num_frames)
+        elif path == '/api/preload':
+            # 预加载下一个物体数据到缓存（前端异步调用）
+            scene_id = query.get('scene_id', [None])[0]
+            object_id = query.get('object_id', [None])[0]
+            num_frames = int(query.get('num_frames', [8])[0])
+            self.handle_preload(scene_id, object_id, num_frames)
         elif path == '/api/object_data':
             # Compatibility endpoint: convert mv_object_data to single-view format
             scene_id = query.get('scene_id', [None])[0]
@@ -122,6 +138,7 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', content_type)
         self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         self.end_headers()
         self.wfile.write(data)
     
@@ -560,18 +577,87 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         return mv_objects
     
     def handle_get_mv_object_data(self, scene_id, object_id, num_frames=8):
-        """获取多视角物体的完整数据"""
+        """获取多视角物体的完整数据（带缓存）"""
         if not all([scene_id, object_id]):
             self.send_json({'error': 'scene_id, object_id required'}, 400)
             return
         
         try:
+            cache_key = f"{scene_id}/{object_id}/{num_frames}"
+            
+            # 检查缓存（但 world_pose/point_pairs 需要实时读取，且需检测 mesh 更新）
+            if cache_key in _object_data_cache:
+                data = _object_data_cache[cache_key]
+                mesh_path = data.get('mesh_path', f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb")
+                mesh_mtime = os.path.getmtime(mesh_path) if os.path.exists(mesh_path) else 0
+                aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/world_pose.npy"
+                alignment_stale = False
+                if os.path.exists(aligned_path):
+                    if mesh_mtime > os.path.getmtime(aligned_path):
+                        alignment_stale = True
+                        print(f"[mv_object_data] ⚠️ 缓存命中但 mesh 已更新，丢弃旧对齐: {cache_key}")
+                        data['world_pose'] = None
+                        data['point_pairs'] = []
+                        # 清除过期的 mesh_info 缓存
+                        mk = f"{scene_id}/{object_id}"
+                        _mesh_info_cache.pop(mk, None)
+                        data['mesh_info'] = self._get_mesh_info(scene_id, object_id)
+                    else:
+                        data['world_pose'] = np.load(aligned_path).tolist()
+                        # 也实时读取 point_pairs
+                        pairs_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/point_pairs.json"
+                        if os.path.exists(pairs_path):
+                            with open(pairs_path, 'r') as f:
+                                data['point_pairs'] = json.load(f)
+                        else:
+                            data['point_pairs'] = []
+                else:
+                    data['world_pose'] = None
+                    data['point_pairs'] = []
+                # 移到最近使用
+                _object_data_cache.move_to_end(cache_key)
+                print(f"[mv_object_data] 缓存命中: {cache_key} (stale={alignment_stale})")
+                self.send_json(data)
+                return
+            
+            start_time = time.time()
             data = self.load_mv_object_data(scene_id, object_id, num_frames)
+            elapsed = time.time() - start_time
+            print(f"[mv_object_data] 加载耗时: {elapsed:.2f}s for {cache_key}")
+            
+            # 存入缓存
+            _object_data_cache[cache_key] = data
+            if len(_object_data_cache) > _OBJECT_DATA_CACHE_MAX:
+                _object_data_cache.popitem(last=False)  # 删除最旧的
+            
             self.send_json(data)
         except Exception as e:
             import traceback
             traceback.print_exc()
             self.send_json({'error': str(e)}, 500)
+    
+    def handle_preload(self, scene_id, object_id, num_frames=8):
+        """预加载物体数据到缓存（前端异步触发，无需完整响应）"""
+        if not all([scene_id, object_id]):
+            self.send_json({'success': False, 'error': 'scene_id, object_id required'})
+            return
+        try:
+            cache_key = f"{scene_id}/{object_id}/{num_frames}"
+            if cache_key in _object_data_cache:
+                self.send_json({'success': True, 'cached': True})
+                return
+            
+            start_time = time.time()
+            data = self.load_mv_object_data(scene_id, object_id, num_frames)
+            _object_data_cache[cache_key] = data
+            if len(_object_data_cache) > _OBJECT_DATA_CACHE_MAX:
+                _object_data_cache.popitem(last=False)
+            elapsed = time.time() - start_time
+            print(f"[preload] 预加载完成: {cache_key} ({elapsed:.2f}s)")
+            self.send_json({'success': True, 'cached': False, 'elapsed': round(elapsed, 2)})
+        except Exception as e:
+            print(f"[preload] 预加载失败: {e}")
+            self.send_json({'success': False, 'error': str(e)})
     
     def handle_get_object_data_compat(self, scene_id, object_id):
         """
@@ -616,8 +702,67 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             traceback.print_exc()
             self.send_json({'error': str(e)}, 500)
     
+    def _get_image_size(self, path):
+        """获取图像尺寸（带缓存）"""
+        if path in _image_size_cache:
+            return _image_size_cache[path]
+        from PIL import Image
+        with Image.open(path) as img:
+            size = img.size  # (width, height)
+        _image_size_cache[path] = size
+        return size
+    
+    def _get_instances(self, scene_id):
+        """获取场景的 instances.json（带缓存）"""
+        if scene_id in _instances_cache:
+            return _instances_cache[scene_id]
+        instances_path = f"{LASA1M_ROOT}/{scene_id}/instances.json"
+        if os.path.exists(instances_path):
+            try:
+                with open(instances_path, 'r') as f:
+                    data = json.load(f)
+                _instances_cache[scene_id] = data
+                return data
+            except:
+                pass
+        _instances_cache[scene_id] = []
+        return []
+    
+    def _get_mesh_info(self, scene_id, object_id):
+        """获取mesh_info（带缓存）"""
+        cache_key = f"{scene_id}/{object_id}"
+        if cache_key in _mesh_info_cache:
+            return _mesh_info_cache[cache_key]
+        
+        mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
+        mesh_info = None
+        try:
+            mesh = trimesh.load(mesh_path)
+            vertices = None
+            if isinstance(mesh, trimesh.Scene):
+                if len(mesh.geometry) > 0:
+                    all_vertices = []
+                    for geom in mesh.geometry.values():
+                        if hasattr(geom, 'vertices'):
+                            all_vertices.append(np.array(geom.vertices))
+                    if all_vertices:
+                        vertices = np.vstack(all_vertices)
+            elif hasattr(mesh, 'vertices') and len(mesh.vertices) > 0:
+                vertices = np.array(mesh.vertices)
+            
+            if vertices is not None and len(vertices) > 0:
+                mesh_info = {
+                    'center': vertices.mean(axis=0).tolist(),
+                    'extent': (vertices.max(axis=0) - vertices.min(axis=0)).tolist()
+                }
+        except Exception as e:
+            print(f"[_get_mesh_info] 警告: {e}")
+        
+        _mesh_info_cache[cache_key] = mesh_info
+        return mesh_info
+    
     def load_mv_object_data(self, scene_id, object_id, num_frames=8):
-        """加载多视角物体数据"""
+        """加载多视角物体数据（优化版：使用多级缓存）"""
         # 1. 检查mesh文件
         mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
         if not os.path.exists(mesh_path):
@@ -638,36 +783,33 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         if not rgb_files:
             raise FileNotFoundError(f"No RGB files found in {rgb_dir}")
         
-        # 4. 两阶段帧选择：先均匀采样12帧，再按mask比例选择num_frames帧
+        # 4. 两阶段帧选择
         total_frames = len(rgb_files)
-        SAMPLE_POOL_SIZE = 12  # 均匀采样的候选池大小
+        SAMPLE_POOL_SIZE = 12
         
         if total_frames <= num_frames:
-            # 帧数不足，全部使用
             selected_indices = list(range(total_frames))
         elif total_frames <= SAMPLE_POOL_SIZE:
-            # 帧数少于候选池大小，全部作为候选
             selected_indices = list(range(total_frames))
         else:
-            # 均匀采样12帧作为候选池
             step = total_frames / SAMPLE_POOL_SIZE
             selected_indices = [int(i * step) for i in range(SAMPLE_POOL_SIZE)]
         
-        print(f"[load_mv_object_data] Sampled {len(selected_indices)} candidate frames from {total_frames} total")
-        
         # 5. 构建帧数据
         frames = []
+        timestamp_to_info = {item.get('timestamp'): item for item in info if item.get('timestamp')}
+        depth_width, depth_height = 512, 384
         
-        # 建立timestamp到info的映射
-        timestamp_to_info = {}
-        for item in info:
-            ts = item.get('timestamp')
-            if ts:
-                timestamp_to_info[ts] = item
-        
-        # 深度图尺寸
-        depth_width = 512
-        depth_height = 384
+        # 预扫描 gt 目录（一次性，而非每帧重复 glob）
+        gt_dir_base = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt"
+        gt_timestamps_map = {}
+        if os.path.isdir(gt_dir_base):
+            for d in os.listdir(gt_dir_base):
+                try:
+                    gt_timestamps_map[int(d)] = d
+                except ValueError:
+                    pass
+        gt_ts_list = sorted(gt_timestamps_map.keys()) if gt_timestamps_map else []
         
         for idx in selected_indices:
             rgb_path = rgb_files[idx]
@@ -677,25 +819,19 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             # 获取相机参数
             frame_info = timestamp_to_info.get(frame_timestamp)
             if not frame_info:
-                # 找最近的
                 timestamps = list(timestamp_to_info.keys())
                 if timestamps:
                     closest_ts = min(timestamps, key=lambda t: abs(t - frame_timestamp))
                     frame_info = timestamp_to_info[closest_ts]
-            
             if not frame_info:
                 continue
             
-            # 获取图像尺寸
-            from PIL import Image
-            with Image.open(rgb_path) as img:
-                image_width, image_height = img.size
+            # 获取图像尺寸（缓存）
+            image_width, image_height = self._get_image_size(rgb_path)
             
-            # 提取相机参数
-            K = frame_info.get('gt_depth_K')  # 3x3 内参
-            RT = frame_info.get('gt_RT')       # 4x4 camera-to-world
+            K = frame_info.get('gt_depth_K')
+            RT = frame_info.get('gt_RT')
             
-            # 内参需要根据图像尺寸调整
             K_scaled = None
             if K and image_width > 0 and image_height > 0:
                 scale_x = image_width / depth_width
@@ -706,32 +842,32 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                     [K[2][0], K[2][1], K[2][2]]
                 ]
             
-            # 检查mask - 直接使用点云直投的mask文件夹
+            # mask
             mask_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/mask/{frame_id}.png"
             mask_subdir = 'mask'
+            mask_exists = os.path.exists(mask_path)
             
-            # 计算mask比例 (mask像素数 / 总像素数)
+            # mask比例（用缓存的图像尺寸避免重复读取）
             mask_ratio = 0.0
-            if os.path.exists(mask_path):
+            if mask_exists:
                 try:
+                    from PIL import Image
                     with Image.open(mask_path) as mask_img:
                         mask_array = np.array(mask_img)
                         if len(mask_array.shape) == 3:
-                            mask_array = mask_array[:, :, 0]  # 取第一通道
-                        mask_pixels = np.sum(mask_array > 128)  # 非零像素
+                            mask_array = mask_array[:, :, 0]
+                        mask_pixels = np.sum(mask_array > 128)
                         total_pixels = mask_array.shape[0] * mask_array.shape[1]
                         mask_ratio = mask_pixels / total_pixels if total_pixels > 0 else 0.0
-                except Exception as e:
-                    print(f"[load_mv_object_data] Error calculating mask ratio: {e}")
+                except:
+                    pass
             
-            # 检查深度图
+            # 深度图（使用预扫描的 gt 目录）
             depth_url = None
-            gt_dirs = sorted(glob.glob(f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt/*"))
-            if gt_dirs:
-                gt_timestamps = [int(os.path.basename(d)) for d in gt_dirs]
-                closest_idx = min(range(len(gt_timestamps)), key=lambda i: abs(gt_timestamps[i] - frame_timestamp))
-                actual_gt_frame = os.path.basename(gt_dirs[closest_idx])
-                depth_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt/{actual_gt_frame}/depth.png"
+            if gt_ts_list:
+                closest_idx = min(range(len(gt_ts_list)), key=lambda i: abs(gt_ts_list[i] - frame_timestamp))
+                actual_gt_frame = gt_timestamps_map[gt_ts_list[closest_idx]]
+                depth_path = f"{gt_dir_base}/{actual_gt_frame}/depth.png"
                 if os.path.exists(depth_path):
                     depth_url = f"/data/depth/{scene_id}/{object_id}/{actual_gt_frame}"
             
@@ -739,96 +875,64 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'frame_id': frame_id,
                 'frame_index': idx,
                 'rgb_url': f"/data/image/{scene_id}/{object_id}/raw_jpg/{frame_id}.jpg",
-                'mask_url': f"/data/image/{scene_id}/{object_id}/{mask_subdir}/{frame_id}.png" if os.path.exists(mask_path) else None,
+                'mask_url': f"/data/image/{scene_id}/{object_id}/{mask_subdir}/{frame_id}.png" if mask_exists else None,
                 'depth_url': depth_url,
-                'mask_ratio': mask_ratio,  # mask占比，用于排序
+                'mask_ratio': mask_ratio,
                 'camera_intrinsics': {
                     'K': K_scaled,
                     'K_original': K,
                     'width': image_width,
                     'height': image_height
                 },
-                'camera_extrinsics': RT  # camera-to-world
+                'camera_extrinsics': RT
             })
         
         # 6. 按mask比例降序排序，选择mask最大的num_frames帧
         frames.sort(key=lambda f: f.get('mask_ratio', 0), reverse=True)
-        
-        # 从候选池中选择mask最大的num_frames帧
         if len(frames) > num_frames:
             frames = frames[:num_frames]
-            print(f"[load_mv_object_data] Selected top {num_frames} frames by mask_ratio from {SAMPLE_POOL_SIZE} candidates")
-        
-        # 更新frame_index为排序后的索引
         for i, frame in enumerate(frames):
             frame['frame_index'] = i
         
-        mask_ratios = [round(f.get('mask_ratio', 0), 3) for f in frames]
-        print(f"[load_mv_object_data] Final {len(frames)} frames, mask_ratios: {mask_ratios}")
-        
-        # 7. 加载已有的world_pose
+        # 7. 加载已有的world_pose（检测 mesh 是否比对齐数据更新）
         world_pose = None
         aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/world_pose.npy"
+        mesh_mtime = os.path.getmtime(mesh_path)
+        alignment_stale = False
         if os.path.exists(aligned_path):
-            world_pose = np.load(aligned_path).tolist()
-        
-        # 8. 读取GT bbox（从instances.json）
-        gt_bbox = None
-        instances_path = f"{LASA1M_ROOT}/{scene_id}/instances.json"
-        print(f"[load_mv_object_data] 查找 gt_bbox: instances_path={instances_path}, object_id={object_id}")
-        if os.path.exists(instances_path):
-            try:
-                with open(instances_path, 'r') as f:
-                    instances = json.load(f)
-                print(f"[load_mv_object_data] instances.json 加载成功, 共 {len(instances)} 个物体")
-                for inst in instances:
-                    if inst.get('id') == object_id:
-                        gt_bbox = {
-                            'position': inst.get('position'),   # 中心点（世界坐标）
-                            'scale': inst.get('scale'),         # 半轴长度（局部坐标系）
-                            'R': inst.get('R'),                 # 旋转矩阵 (可选)
-                            'corners': inst.get('corners')      # 8 个角点（世界坐标系）- 直接使用！
-                        }
-                        print(f"[load_mv_object_data] 找到 gt_bbox: position={gt_bbox['position']}, scale={gt_bbox['scale']}, has_corners={gt_bbox['corners'] is not None}")
-                        break
-                if gt_bbox is None:
-                    print(f"[load_mv_object_data] 警告: 未在 instances.json 中找到 object_id={object_id}")
-            except Exception as e:
-                print(f"[load_mv_object_data] 警告: 加载instances.json失败: {e}")
-        else:
-            print(f"[load_mv_object_data] 警告: instances.json 不存在: {instances_path}")
-        
-        # 9. 加载mesh计算mesh_info (center, extent)
-        mesh_info = None
-        try:
-            mesh = trimesh.load(mesh_path)
-            vertices = None
-            
-            # 处理 Scene 对象（glb 文件通常返回 Scene）
-            if isinstance(mesh, trimesh.Scene):
-                if len(mesh.geometry) > 0:
-                    # 合并所有 geometry 的顶点
-                    all_vertices = []
-                    for geom in mesh.geometry.values():
-                        if hasattr(geom, 'vertices'):
-                            all_vertices.append(np.array(geom.vertices))
-                    if all_vertices:
-                        vertices = np.vstack(all_vertices)
-            elif hasattr(mesh, 'vertices') and len(mesh.vertices) > 0:
-                vertices = np.array(mesh.vertices)
-            
-            if vertices is not None and len(vertices) > 0:
-                mesh_center = vertices.mean(axis=0).tolist()
-                mesh_extent = (vertices.max(axis=0) - vertices.min(axis=0)).tolist()
-                mesh_info = {
-                    'center': mesh_center,
-                    'extent': mesh_extent
-                }
-                print(f"[load_mv_object_data] mesh_info: center={mesh_center}, extent={mesh_extent}")
+            aligned_mtime = os.path.getmtime(aligned_path)
+            if mesh_mtime > aligned_mtime:
+                # mesh 文件比对齐数据新，对齐数据已过期
+                alignment_stale = True
+                print(f"[load_mv_object_data] ⚠️ mesh 已更新 (mesh={mesh_mtime:.0f} > aligned={aligned_mtime:.0f})，丢弃旧对齐数据: {scene_id}/{object_id}")
             else:
-                print(f"[load_mv_object_data] 警告: mesh 无顶点数据")
-        except Exception as e:
-            print(f"[load_mv_object_data] 警告: 加载mesh失败: {e}")
+                world_pose = np.load(aligned_path).tolist()
+        
+        # 8. 读取GT bbox（缓存 instances.json）
+        gt_bbox = None
+        instances = self._get_instances(scene_id)
+        for inst in instances:
+            if inst.get('id') == object_id:
+                gt_bbox = {
+                    'position': inst.get('position'),
+                    'scale': inst.get('scale'),
+                    'R': inst.get('R'),
+                    'corners': inst.get('corners')
+                }
+                break
+        
+        # 9. mesh_info（缓存 trimesh.load，但 mesh 更新时需清缓存）
+        if alignment_stale:
+            cache_key = f"{scene_id}/{object_id}"
+            _mesh_info_cache.pop(cache_key, None)
+        mesh_info = self._get_mesh_info(scene_id, object_id)
+        
+        # 10. 加载已保存的关键点对（mesh 更新时丢弃旧点对）
+        saved_point_pairs = []
+        pairs_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/point_pairs.json"
+        if os.path.exists(pairs_path) and not alignment_stale:
+            with open(pairs_path, 'r') as f:
+                saved_point_pairs = json.load(f)
         
         return {
             'scene_id': scene_id,
@@ -839,7 +943,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'frames': frames,
             'total_frames': total_frames,
             'gt_bbox': gt_bbox,
-            'mesh_info': mesh_info
+            'mesh_info': mesh_info,
+            'point_pairs': saved_point_pairs
         }
     
     def serve_data_file(self, path):

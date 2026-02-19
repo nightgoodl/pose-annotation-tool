@@ -36,7 +36,7 @@ class MeshRenderer:
     
     def _load_mesh(self, mesh_path: str) -> dict:
         """
-        加载并缓存 mesh
+        加载并缓存 mesh（带文件修改时间检查）
         
         Args:
             mesh_path: mesh 文件路径 (GLB/OBJ)
@@ -44,8 +44,13 @@ class MeshRenderer:
         Returns:
             包含 vertices, faces, vertex_colors 的字典
         """
+        # 检查缓存：比较文件修改时间
+        current_mtime = os.path.getmtime(mesh_path)
         if mesh_path in self._mesh_cache:
-            return self._mesh_cache[mesh_path]
+            cached = self._mesh_cache[mesh_path]
+            if cached.get('_mtime') == current_mtime:
+                return cached
+            print(f"[MeshRenderer] mesh 文件已更新，重新加载: {mesh_path}")
         
         # 加载 mesh
         mesh = trimesh.load(mesh_path, force='mesh')
@@ -67,6 +72,7 @@ class MeshRenderer:
             'vertices': vertices,
             'faces': faces,
             'vertex_colors': vertex_colors,
+            '_mtime': current_mtime,
         }
         
         # 缓存

@@ -9,7 +9,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useMVAnnotationStore } from '../stores/mvAnnotationStore';
-import { MVFrameView } from './MVFrameView';
+import { MVFrameView, clearModelCache } from './MVFrameView';
 import { MVModelViewer } from './MVModelViewer';
 import { MVControlPanel } from './MVControlPanel';
 import { ToastContainer } from './ToastContainer';
@@ -71,14 +71,25 @@ async function loadMVObjectData(sceneId: string, objectId: string, numFrames: nu
     console.log('[loadMVObjectData] gt_bbox:', data.gt_bbox);
     console.log('[loadMVObjectData] mesh_info:', data.mesh_info);
     
+    // 将后端保存的 point_pairs 转换为 MVPointPair 格式（补充 id 和 depth）
+    const savedPointPairs = (data.point_pairs || []).map((p, i) => ({
+      id: `restored_${i}`,
+      frame_id: p.frame_id,
+      localPoint: p.localPoint,
+      worldPoint: p.worldPoint,
+      pixelCoord: p.pixelCoord,
+      depth: 0
+    }));
+    
     return {
       objectId: `${data.scene_id}_${data.object_id}`,
-      meshUrl: data.mesh_url,
+      meshUrl: `${data.mesh_url}?t=${Date.now()}`,
       meshPath: data.mesh_path,
       frames: data.frames,
       initialPose: data.world_pose as Matrix4 | null,
       gtBbox: data.gt_bbox as BboxInfo | null,
-      meshInfo: data.mesh_info as MeshInfo | null
+      meshInfo: data.mesh_info as MeshInfo | null,
+      savedPointPairs: savedPointPairs.length > 0 ? savedPointPairs : undefined
     };
   } catch (e) {
     console.error('Failed to load MV object data:', e);
@@ -102,33 +113,38 @@ interface MVObjectsResponse {
   };
 }
 
+// 筛选状态类型
+interface SelectorFilterState {
+  page: number;
+  selectedScene: string;
+  statusFilter: string;
+  sortBy: string | null;
+  sortOrder: 'asc' | 'desc';
+}
+
 // 数据选择器组件
 interface MVDataSelectorProps {
   onSelect: (data: MVAnnotationInput) => void;
   savedObjectInfo?: {objectId: string; category: string} | null;
+  filterState: SelectorFilterState;
+  onFilterChange: (state: Partial<SelectorFilterState>) => void;
 }
 
-function MVDataSelector({ onSelect, savedObjectInfo }: MVDataSelectorProps) {
+function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange }: MVDataSelectorProps) {
   const [mvObjects, setMVObjects] = useState<MVObjectItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [numFrames, setNumFrames] = useState(4);
   
-  // 分页状态
-  const [page, setPage] = useState(1);
+  // 从 props 读取筛选状态
+  const { page, selectedScene, statusFilter, sortBy, sortOrder } = filterState;
+  
+  // 分页状态（仅本地）
   const [pageSize] = useState(50);
   const [totalPages, setTotalPages] = useState(1);
   const [total, setTotal] = useState(0);
   const [scenes, setScenes] = useState<string[]>([]);
-  const [selectedScene, setSelectedScene] = useState<string>('');
-  
-  // 排序状态
-  const [sortBy, setSortBy] = useState<string | null>(null);
-  const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
-  
-  // 状态过滤
-  const [statusFilter, setStatusFilter] = useState<string>('');
   
   // 统计
   const [stats, setStats] = useState<{all: number; pending: number; aligned: number; invalid: number}>({all: 0, pending: 0, aligned: 0, invalid: 0});
@@ -166,30 +182,29 @@ function MVDataSelector({ onSelect, savedObjectInfo }: MVDataSelectorProps) {
       setMVObjects(data.mv_objects || []);
       setTotal(data.total);
       setTotalPages(data.total_pages);
-      setPage(data.page);
+      onFilterChange({ page: data.page });
       if (data.scenes && data.scenes.length > 0) setScenes(data.scenes);
       if (data.stats) setStats(data.stats);
     } catch (e) {
       setError(`无法连接数据服务器 (${MV_DATA_SERVER})。请确保服务器已启动。`);
     }
     setLoading(false);
-  }, [pageSize]);
+  }, [pageSize, onFilterChange]);
   
-  // 初始加载
-  useEffect(() => { loadMVObjects(1, ''); }, [loadMVObjects]);
+  // 初始加载（使用保存的筛选状态）
+  useEffect(() => { loadMVObjects(page, selectedScene, sortBy, sortOrder, statusFilter); }, [loadMVObjects]);
   
   const reload = (p?: number, scene?: string, sort?: string | null, order?: 'asc' | 'desc', status?: string) => {
     loadMVObjects(p ?? page, scene ?? selectedScene, sort ?? sortBy, order ?? sortOrder, status ?? statusFilter);
   };
   
-  const handleSceneChange = (scene: string) => { setSelectedScene(scene); loadMVObjects(1, scene, sortBy, sortOrder, statusFilter); };
-  const handlePageChange = (p: number) => { loadMVObjects(p, selectedScene, sortBy, sortOrder, statusFilter); };
-  const handleStatusFilter = (s: string) => { setStatusFilter(s); loadMVObjects(1, selectedScene, sortBy, sortOrder, s); };
+  const handleSceneChange = (scene: string) => { onFilterChange({ selectedScene: scene, page: 1 }); loadMVObjects(1, scene, sortBy, sortOrder, statusFilter); };
+  const handlePageChange = (p: number) => { onFilterChange({ page: p }); loadMVObjects(p, selectedScene, sortBy, sortOrder, statusFilter); };
+  const handleStatusFilter = (s: string) => { onFilterChange({ statusFilter: s, page: 1 }); loadMVObjects(1, selectedScene, sortBy, sortOrder, s); };
   
   const handleSort = (key: string) => {
     const newOrder = sortBy === key && sortOrder === 'desc' ? 'asc' : 'desc';
-    setSortBy(key);
-    setSortOrder(newOrder);
+    onFilterChange({ sortBy: key, sortOrder: newOrder, page: 1 });
     loadMVObjects(1, selectedScene, key, newOrder, statusFilter);
   };
   
@@ -412,7 +427,20 @@ export function MVPoseAnnotationTool() {
   // 记录当前使用的帧数设置
   const [numFrames, setNumFrames] = useState(4);
   
+  // 数据选择器筛选状态（提升到父组件，返回时保留）
+  const [selectorFilter, setSelectorFilter] = useState<SelectorFilterState>({
+    page: 1,
+    selectedScene: '',
+    statusFilter: '',
+    sortBy: null,
+    sortOrder: 'desc',
+  });
+  const handleFilterChange = useCallback((partial: Partial<SelectorFilterState>) => {
+    setSelectorFilter(prev => ({ ...prev, ...partial }));
+  }, []);
+  
   const handleDataSelect = useCallback((data: MVAnnotationInput) => {
+    clearModelCache();
     setCurrentInput(data);
   }, [setCurrentInput]);
   
@@ -510,6 +538,7 @@ export function MVPoseAnnotationTool() {
       }
       
       // 步骤4：切换到新的标注对象
+      clearModelCache();
       setCurrentInput(objectData);
       showGlobalToast(
         `已切换到下一个物体 (剩余 ${nextTaskResponse.remaining_count - 1} 个)`,
@@ -575,6 +604,7 @@ export function MVPoseAnnotationTool() {
       }
       
       // 切换到新的标注对象
+      clearModelCache();
       setCurrentInput(objectData);
       showGlobalToast(
         `已跳转下一个物体 (剩余 ${nextTaskResponse.remaining_count - 1} 个)`,
@@ -615,7 +645,7 @@ export function MVPoseAnnotationTool() {
   
   // 没有数据时显示数据选择器
   if (!currentInput) {
-    return <MVDataSelector onSelect={handleDataSelect} savedObjectInfo={savedObjectInfo} />;
+    return <MVDataSelector onSelect={handleDataSelect} savedObjectInfo={savedObjectInfo} filterState={selectorFilter} onFilterChange={handleFilterChange} />;
   }
   
   return (
@@ -685,6 +715,7 @@ export function MVPoseAnnotationTool() {
                 const objectData = await loadMVObjectData(nextTaskResponse.data.scene_id, nextTaskResponse.data.object_id, numFrames);
                 
                 if (objectData) {
+                  clearModelCache();
                   setCurrentInput(objectData);
                   showGlobalToast(`已跳转下一个 (剩余 ${nextTaskResponse.remaining_count - 1} 个)`, 'success', 2000);
                 } else {
