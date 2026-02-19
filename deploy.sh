@@ -48,17 +48,17 @@ fi
 export CUDA_VISIBLE_DEVICES=7
 echo "   CUDA device: 7"
 
-nohup $PYTHON_CMD server/data_server_mv.py 8084 > logs/backend.log 2>&1 &
+PYTHONUNBUFFERED=1 nohup $PYTHON_CMD server/data_server_mv.py 8084 > logs/backend.log 2>&1 &
 BACKEND_PID=$!
 echo "   Backend PID: $BACKEND_PID"
 
-# Wait for backend to start
-echo "   Waiting for backend to initialize..."
-sleep 3
+# Wait for backend to start (cache warmup can take a while with 1000+ scenes)
+echo "   Waiting for backend to initialize (may take up to 5min for cache warmup)..."
+sleep 5
 
 # Check if backend port is listening
 BACKEND_READY=0
-for i in {1..10}; do
+for i in {1..300}; do
     if netstat -tuln 2>/dev/null | grep -q ":8084" || ss -tuln 2>/dev/null | grep -q ":8084"; then
         BACKEND_READY=1
         break
