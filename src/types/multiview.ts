@@ -49,6 +49,12 @@ export interface MVObjectData {
   total_frames: number;
   gt_bbox: BboxInfo | null;
   mesh_info: MeshInfo | null;
+  point_pairs?: Array<{
+    frame_id: string;
+    localPoint: Point3D;
+    worldPoint: Point3D;
+    pixelCoord: PixelCoord;
+  }>;
 }
 
 // 多视角点对匹配 (包含帧信息)
@@ -83,6 +89,7 @@ export interface MVAnnotationInput {
   initialPose: Matrix4 | null;  // 初始pose
   gtBbox: BboxInfo | null;    // GT bbox信息
   meshInfo: MeshInfo | null;  // Mesh信息（用于 Bbox Align）
+  savedPointPairs?: MVPointPair[];  // 之前保存的关键点对
 }
 
 // 多视角标注输出结果

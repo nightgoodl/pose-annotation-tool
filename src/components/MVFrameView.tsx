@@ -309,6 +309,12 @@ function computeConvexHull(points: { x: number; y: number }[]): { x: number; y: 
 // 缓存加载的模型
 const modelCache = new Map<string, THREE.Group>();
 
+/** 清除前端 GLTF 模型缓存（切换物体时调用） */
+export function clearModelCache() {
+  modelCache.clear();
+  console.log('[clearModelCache] 前端模型缓存已清除');
+}
+
 function ProjectedMeshOutline({ modelUrl, pose, intrinsics, extrinsics, imageWidth, imageHeight, maskUrl, onIoUCalculated }: ProjectedMeshOutlineProps) {
   const [gltfScene, setGltfScene] = useState<THREE.Group | null>(null);
   const [loading, setLoading] = useState(true);

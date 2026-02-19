@@ -119,12 +119,21 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
   setCurrentInput: (input) => {
     console.log('[setCurrentInput] gtBbox:', input?.gtBbox);
     console.log('[setCurrentInput] meshInfo:', input?.meshInfo);
+    
+    // 恢复已保存的关键点对
+    const restoredPairs = input?.savedPointPairs ?? [];
+    if (restoredPairs.length > 0) {
+      // 更新 pairIdCounter 避免 ID 冲突
+      pairIdCounter = restoredPairs.length;
+      console.log(`[setCurrentInput] 恢复 ${restoredPairs.length} 个关键点对`);
+    }
+    
     set({ 
       currentInput: input,
       activeFrameId: input?.frames[0]?.frame_id ?? null,
       workflowState: 'annotation',
       category: 'valid',
-      pointPairs: [],
+      pointPairs: restoredPairs,
       selectedPairId: null,
       pendingLocalPoint: null,
       pendingWorldPoint: null,
@@ -135,6 +144,11 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       averageIoU: 0,
       isAnnotationEnabled: true
     });
+    
+    // 如果有恢复的点对且>=3个，自动运行对齐
+    if (restoredPairs.length >= 3) {
+      get().runAlignment(false);
+    }
   },
   
   // ========== 帧管理 ==========
@@ -194,6 +208,14 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       pointPairs: state.pointPairs.filter(p => p.id !== id),
       selectedPairId: state.selectedPairId === id ? null : state.selectedPairId
     }));
+    // 删除后自动重新对齐
+    const state = get();
+    if (state.pointPairs.length >= 3) {
+      state.runAlignment(false);
+    } else {
+      // 点数不足，清除对齐结果
+      set({ calculatedPose: state.currentInput?.initialPose ?? null, calculatedScale: 1, alignmentError: 0 });
+    }
   },
   
   selectPointPair: (id) => set({ selectedPairId: id }),
