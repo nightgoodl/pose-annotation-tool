@@ -39,6 +39,13 @@ MV_SAM_V3_ROOT = f"{DATA_ROOT}/LASA1M_MV_SAM_v3"
 ANNOTATE_ROOT = f"{DATA_ROOT}/LASA1M_ANNOTATE"
 MV_ALIGNED_ROOT = f"{DATA_ROOT}/LASA1M_ALIGNED_MV"  # 多视角对齐结果保存目录
 
+# TOS 模式配置
+TOS_MODE = os.environ.get("USE_TOS", "0") == "1"
+MANIFEST_PATH = os.environ.get("MANIFEST_PATH", os.path.join(os.path.dirname(__file__), "manifest.json"))
+if TOS_MODE:
+    import tos_client
+    print(f"[TOS_MODE] 已启用 TOS 数据源, manifest: {MANIFEST_PATH}, cache: {tos_client.TOS_CACHE_DIR}")
+
 # 全局缓存
 _mv_objects_cache = None
 _mv_objects_cache_time = 0
@@ -439,6 +446,17 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         
         # 立即更新缓存，避免 next_mv_task 重复返回已标注物体
         self._update_single_object_cache(scene_id, object_id)
+        
+        # TOS 模式：标注完成后删除本地 tar 缓存以释放磁盘空间
+        if TOS_MODE:
+            # 清除内存缓存
+            cache_key = f"{scene_id}/{object_id}"
+            _mesh_info_cache.pop(cache_key, None)
+            for k in list(_object_data_cache.keys()):
+                if k.startswith(f"{scene_id}/{object_id}/"):
+                    _object_data_cache.pop(k, None)
+            # 删除解压的 tar 目录
+            tos_client.delete_object_cache(scene_id, object_id)
         
         # 记录标注日志（只记录成功对齐的，invalid 和 align_difficult 不计入统计）
         user, _ = self.get_current_user()
@@ -847,7 +865,65 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             print(f"[complete_scene] 场景 {scene_id} 已完成")
     
     def _build_mv_objects_cache(self):
-        """构建物体列表缓存（基于 v3 mask/image 数据，检查 v4 mesh 存在）"""
+        """构建物体列表缓存"""
+        if TOS_MODE:
+            return self._build_mv_objects_cache_tos()
+        return self._build_mv_objects_cache_local()
+    
+    def _build_mv_objects_cache_tos(self):
+        """TOS 模式：从 manifest.json 构建物体列表"""
+        mv_objects = []
+        
+        if not os.path.exists(MANIFEST_PATH):
+            print(f"[_build_mv_objects_cache_tos] manifest 文件不存在: {MANIFEST_PATH}")
+            return mv_objects
+        
+        with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+        
+        for entry in manifest.get('objects', []):
+            scene_id = entry['scene_id']
+            object_id = entry['object_id']
+            
+            # TOS 模式下缩略图不可用（tar 包在浏览列表时尚未下载）
+            thumbnail_url = None
+            
+            # 检查是否已有对齐结果和分类状态
+            aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
+            has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
+            
+            category = None
+            num_point_pairs = 0
+            average_iou = 0.0
+            saved_at = None
+            result_path = f"{aligned_path}/result.json"
+            if os.path.exists(result_path):
+                with open(result_path, 'r') as f:
+                    result_data = json.load(f)
+                    category = result_data.get('category')
+                    num_point_pairs = result_data.get('num_point_pairs', 0)
+                    average_iou = result_data.get('average_iou', 0.0)
+                    saved_at = result_data.get('saved_at')
+            
+            mv_objects.append({
+                'scene_id': scene_id,
+                'object_id': object_id,
+                'num_frames': entry.get('num_frames', -1),
+                'has_mesh': True,  # tar 包内一定有 mesh
+                'has_alignment': has_alignment,
+                'category': category,
+                'obj_category': entry.get('category', ''),
+                'thumbnail_url': thumbnail_url,
+                'num_point_pairs': num_point_pairs,
+                'average_iou': average_iou,
+                'saved_at': saved_at
+            })
+        
+        mv_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))
+        return mv_objects
+    
+    def _build_mv_objects_cache_local(self):
+        """本地模式：基于 v3 mask/image 数据，检查 v4 mesh 存在"""
         mv_objects = []
         
         # 遍历 MV_SAM_V3 目录
@@ -1072,13 +1148,19 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         _instances_cache[scene_id] = []
         return []
     
-    def _get_mesh_info(self, scene_id, object_id):
+    def _get_mesh_info(self, scene_id, object_id, mesh_path_override=None):
         """获取mesh_info（带缓存）"""
         cache_key = f"{scene_id}/{object_id}"
         if cache_key in _mesh_info_cache:
             return _mesh_info_cache[cache_key]
         
-        mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
+        if mesh_path_override:
+            mesh_path = mesh_path_override
+        elif TOS_MODE:
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            mesh_path = os.path.join(obj_dir, "mesh.glb")
+        else:
+            mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
         mesh_info = None
         try:
             mesh = trimesh.load(mesh_path)
@@ -1106,7 +1188,127 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         return mesh_info
     
     def load_mv_object_data(self, scene_id, object_id, num_frames=8):
-        """加载多视角物体数据（v3 固定帧 + ANNOTATE depth/info）"""
+        """加载多视角物体数据"""
+        if TOS_MODE:
+            return self._load_mv_object_data_tos(scene_id, object_id, num_frames)
+        return self._load_mv_object_data_local(scene_id, object_id, num_frames)
+    
+    def _load_mv_object_data_tos(self, scene_id, object_id, num_frames=8):
+        """TOS 模式：从下载解压的 tar 缓存加载物体数据"""
+        # 1. 确保 tar 已下载并解压到本地缓存
+        obj_dir = tos_client.ensure_object_cached(scene_id, object_id)
+        
+        # 2. 读取 mesh
+        mesh_path = os.path.join(obj_dir, "mesh.glb")
+        if not os.path.exists(mesh_path):
+            raise FileNotFoundError(f"Mesh not found in tar cache: {mesh_path}")
+        mesh_url = f"/data/tar_mesh/{scene_id}/{object_id}/mesh.glb"
+        
+        # 3. 读取 meta.json 获取 bbox 和基本信息
+        meta_path = os.path.join(obj_dir, "meta.json")
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        
+        total_frames = meta.get('num_frames', 0)
+        
+        # 4. 构建帧数据（从 {idx}.cam.json 读取相机参数）
+        frames = []
+        for idx in range(min(total_frames, num_frames)):
+            idx_str = f"{idx:05d}"
+            
+            # 检查 RGB 文件存在
+            rgb_path = os.path.join(obj_dir, f"{idx_str}.rgb.webp")
+            if not os.path.exists(rgb_path):
+                continue
+            
+            # 读取相机参数
+            cam_path = os.path.join(obj_dir, f"{idx_str}.cam.json")
+            if not os.path.exists(cam_path):
+                continue
+            with open(cam_path, 'r') as f:
+                cam = json.load(f)
+            
+            # 获取图像尺寸
+            image_width, image_height = self._get_image_size(rgb_path)
+            
+            K = cam.get('gt_depth_K')
+            RT = cam.get('gt_RT')
+            image_K = cam.get('image_K')
+            
+            # image_K 是全分辨率内参，可直接使用
+            K_scaled = image_K
+            
+            # mask
+            mask_path = os.path.join(obj_dir, f"{idx_str}.mask.png")
+            mask_exists = os.path.exists(mask_path)
+            mask_ratio = cam.get('mask_ratio', 0.0)
+            
+            # depth
+            depth_path = os.path.join(obj_dir, f"{idx_str}.depth.png")
+            depth_url = f"/data/tar_depth/{scene_id}/{object_id}/{idx_str}" if os.path.exists(depth_path) else None
+            
+            frames.append({
+                'frame_id': str(cam.get('timestamp', idx)),
+                'frame_index': idx,
+                'rgb_url': f"/data/tar_rgb/{scene_id}/{object_id}/{idx_str}.webp",
+                'mask_url': f"/data/tar_mask/{scene_id}/{object_id}/{idx_str}.png" if mask_exists else None,
+                'depth_url': depth_url,
+                'mask_ratio': mask_ratio,
+                'camera_intrinsics': {
+                    'K': K_scaled,
+                    'K_original': K,
+                    'width': image_width,
+                    'height': image_height
+                },
+                'camera_extrinsics': RT
+            })
+        
+        for i, frame in enumerate(frames):
+            frame['frame_index'] = i
+        
+        # 5. 加载已有的 world_pose
+        world_pose = None
+        aligned_npy = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/world_pose.npy"
+        if os.path.exists(aligned_npy):
+            world_pose = np.load(aligned_npy).tolist()
+        
+        # 6. GT bbox 从 meta.json
+        gt_bbox = {
+            'position': meta.get('position'),
+            'scale': meta.get('scale'),
+            'R': meta.get('R'),
+            'corners': meta.get('corners')
+        }
+        obj_category = meta.get('category')
+        obj_caption = meta.get('caption')
+        
+        # 7. mesh_info
+        mesh_info = self._get_mesh_info(scene_id, object_id, mesh_path_override=mesh_path)
+        
+        # 8. 已保存的关键点对
+        saved_point_pairs = []
+        pairs_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/point_pairs.json"
+        if os.path.exists(pairs_path):
+            with open(pairs_path, 'r') as f:
+                saved_point_pairs = json.load(f)
+        
+        return {
+            'scene_id': scene_id,
+            'object_id': object_id,
+            'mesh_url': mesh_url,
+            'mesh_path': mesh_path,
+            'world_pose': world_pose,
+            'frames': frames,
+            'total_frames': total_frames,
+            'gt_bbox': gt_bbox,
+            'obj_category': obj_category,
+            'obj_caption': obj_caption,
+            'mesh_info': mesh_info,
+            'point_pairs': saved_point_pairs
+        }
+    
+    def _load_mv_object_data_local(self, scene_id, object_id, num_frames=8):
+        """本地模式：v3 固定帧 + ANNOTATE depth/info"""
         # 1. 检查mesh文件
         mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
         if not os.path.exists(mesh_path):
@@ -1370,6 +1572,61 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             scene_id, object_id, frame_id = parts[1], parts[2], parts[3]
             depth_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt/{frame_id}/depth.png"
             self._serve_depth_png(depth_path)
+        
+        elif parts[0] == 'tar_rgb':
+            # /data/tar_rgb/{scene_id}/{object_id}/{idx}.webp
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            file_path = os.path.join(obj_dir, filename.replace('.webp', '.rgb.webp'))
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'image/webp')
+            else:
+                self.send_error(404, f"tar rgb not found: {file_path}")
+        
+        elif parts[0] == 'tar_mask':
+            # /data/tar_mask/{scene_id}/{object_id}/{idx}.png
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            file_path = os.path.join(obj_dir, filename.replace('.png', '.mask.png'))
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'image/png')
+            else:
+                self.send_error(404, f"tar mask not found: {file_path}")
+        
+        elif parts[0] == 'tar_depth':
+            # /data/tar_depth/{scene_id}/{object_id}/{idx}
+            scene_id, object_id, idx_str = parts[1], parts[2], parts[3]
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            depth_path = os.path.join(obj_dir, f"{idx_str}.depth.png")
+            self._serve_depth_png(depth_path)
+        
+        elif parts[0] == 'tar_mesh':
+            # /data/tar_mesh/{scene_id}/{object_id}/mesh.glb
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            file_path = os.path.join(obj_dir, filename)
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'model/gltf-binary')
+            else:
+                self.send_error(404, f"tar mesh not found: {file_path}")
+        
+        elif parts[0] == 'tar_render':
+            # /data/tar_render/{scene_id}/{object_id}/{filename}.webp
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            obj_dir = tos_client.get_object_dir(scene_id, object_id)
+            file_path = os.path.join(obj_dir, filename)
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'image/webp')
+            else:
+                self.send_error(404, f"tar render not found: {file_path}")
         
         else:
             self.send_error(404, f"Unknown data type: {parts[0]}")
