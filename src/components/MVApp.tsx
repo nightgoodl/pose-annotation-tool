@@ -13,7 +13,9 @@ import { MVFrameView, clearModelCache } from './MVFrameView';
 import { MVModelViewer } from './MVModelViewer';
 import { MVControlPanel } from './MVControlPanel';
 import { ToastContainer } from './ToastContainer';
+import { LoginPage } from './LoginPage';
 import { showGlobalToast } from '../hooks/useToast';
+import { isLoggedIn, getToken, logout, getCurrentUser, getStoredUser, type User, type UserStats } from '../utils/api';
 import type { MVAnnotationInput, MVObjectItem, MVObjectData, BboxInfo, MeshInfo } from '../types/multiview';
 import type { Matrix4 } from '../types';
 
@@ -34,6 +36,18 @@ interface NextMVTaskResponse {
   message?: string;
 }
 
+// 获取带认证的请求头
+function getAuthHeaders(): Record<string, string> {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 // 获取下一个待标注MV任务
 async function fetchNextMVTask(currentSceneId?: string, excludeObjectId?: string): Promise<NextMVTaskResponse> {
   const params = new URLSearchParams();
@@ -41,7 +55,7 @@ async function fetchNextMVTask(currentSceneId?: string, excludeObjectId?: string
   if (excludeObjectId) params.set('exclude_object_id', excludeObjectId);
   
   const url = `${MV_DATA_SERVER}/api/next_mv_task?${params.toString()}`;
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: getAuthHeaders() });
   
   if (!response.ok) {
     throw new Error(`获取下一个任务失败: HTTP ${response.status} (请确认后端服务已重启)`);
@@ -59,7 +73,8 @@ async function fetchNextMVTask(currentSceneId?: string, excludeObjectId?: string
 async function loadMVObjectData(sceneId: string, objectId: string, numFrames: number = 4): Promise<MVAnnotationInput | null> {
   try {
     const response = await fetch(
-      `${MV_DATA_SERVER}/api/mv_object_data?scene_id=${sceneId}&object_id=${objectId}&num_frames=${numFrames}`
+      `${MV_DATA_SERVER}/api/mv_object_data?scene_id=${sceneId}&object_id=${objectId}&num_frames=${numFrames}`,
+      { headers: getAuthHeaders() }
     );
     const data: MVObjectData = await response.json();
     
@@ -110,6 +125,7 @@ interface MVObjectsResponse {
     pending: number;
     aligned: number;
     invalid: number;
+    align_difficult: number;
   };
 }
 
@@ -128,14 +144,18 @@ interface MVDataSelectorProps {
   savedObjectInfo?: {objectId: string; category: string} | null;
   filterState: SelectorFilterState;
   onFilterChange: (state: Partial<SelectorFilterState>) => void;
+  user?: User | null;
+  userStats?: UserStats | null;
+  onLogout?: () => void;
 }
 
-function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange }: MVDataSelectorProps) {
+function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange, user, userStats, onLogout }: MVDataSelectorProps) {
   const [mvObjects, setMVObjects] = useState<MVObjectItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingData, setLoadingData] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [numFrames, setNumFrames] = useState(4);
+  const [claiming, setClaiming] = useState(false);
   
   // 从 props 读取筛选状态
   const { page, selectedScene, statusFilter, sortBy, sortOrder } = filterState;
@@ -147,7 +167,7 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
   const [scenes, setScenes] = useState<string[]>([]);
   
   // 统计
-  const [stats, setStats] = useState<{all: number; pending: number; aligned: number; invalid: number}>({all: 0, pending: 0, aligned: 0, invalid: 0});
+  const [stats, setStats] = useState<{all: number; pending: number; aligned: number; invalid: number; align_difficult: number}>({all: 0, pending: 0, aligned: 0, invalid: 0, align_difficult: 0});
   
   // 当有保存的对象信息时，直接更新本地列表
   useEffect(() => {
@@ -158,7 +178,7 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
       
       setMVObjects(prev => prev.map(obj => {
         if (obj.scene_id === sceneId && obj.object_id === objectId) {
-          return { ...obj, category: savedObjectInfo.category as 'valid' | 'fixed' | 'invalid', has_alignment: true };
+          return { ...obj, category: savedObjectInfo.category as 'valid' | 'fixed' | 'invalid' | 'align_difficult', has_alignment: true };
         }
         return obj;
       }));
@@ -177,7 +197,7 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
       if (sort) url += `&sort_by=${sort}&sort_order=${order || 'desc'}`;
       if (status) url += `&status=${status}`;
       
-      const response = await fetch(url);
+      const response = await fetch(url, { headers: getAuthHeaders() });
       const data: MVObjectsResponse = await response.json();
       setMVObjects(data.mv_objects || []);
       setTotal(data.total);
@@ -208,6 +228,31 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
     loadMVObjects(1, selectedScene, key, newOrder, statusFilter);
   };
   
+  // 领取新场景
+  const handleClaimScenes = async () => {
+    if (claiming) return;
+    setClaiming(true);
+    try {
+      const response = await fetch(`${MV_DATA_SERVER}/api/claim_scenes`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({})
+      });
+      const data = await response.json();
+      if (data.success) {
+        showGlobalToast(data.message, data.assigned?.length > 0 ? 'success' : 'info', 3000);
+        // 刷新列表
+        loadMVObjects(1, '', sortBy, sortOrder, statusFilter);
+        onFilterChange({ selectedScene: '', page: 1 });
+      } else {
+        showGlobalToast(data.error || '领取失败', 'error', 3000);
+      }
+    } catch (e) {
+      showGlobalToast('领取场景失败', 'error', 3000);
+    }
+    setClaiming(false);
+  };
+  
   const handleSelect = async (obj: MVObjectItem) => {
     setLoadingData(true);
     const data = await loadMVObjectData(obj.scene_id, obj.object_id, numFrames);
@@ -217,6 +262,7 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
   
   const getStatusInfo = (obj: MVObjectItem) => {
     if (obj.category === 'invalid') return { text: '无效', cls: 'bg-red-600' };
+    if (obj.category === 'align_difficult') return { text: '对齐困难', cls: 'bg-orange-600' };
     if (obj.category === 'fixed' || obj.has_alignment) return { text: '已对齐', cls: 'bg-green-600' };
     return { text: '待标注', cls: 'bg-gray-600' };
   };
@@ -239,6 +285,45 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
       <header className="h-12 bg-gray-800 border-b border-gray-700 flex items-center px-4">
         <h1 className="text-white font-semibold">多视角位姿标注工具</h1>
         <span className="ml-4 text-gray-400 text-sm">共 {stats.all} 个物体</span>
+        
+        {/* 用户信息区域 */}
+        <div className="ml-auto flex items-center gap-4">
+          {user && (
+            <>
+              <div className="flex items-center gap-2 text-sm">
+                <span className="text-gray-400">用户:</span>
+                <span className="text-white font-medium">{user.username}</span>
+                {user.role === 'admin' && (
+                  <span className="px-1.5 py-0.5 bg-purple-600 text-white text-xs rounded">管理员</span>
+                )}
+              </div>
+              {userStats && (
+                <div className="flex items-center gap-3 text-sm text-gray-400">
+                  <span>今日: <span className="text-green-400 font-medium">{userStats.today}</span></span>
+                  <span>总计: <span className="text-blue-400 font-medium">{userStats.total}</span></span>
+                  <span>场景: <span className="text-yellow-400 font-medium">{userStats.active_scenes}</span>个</span>
+                </div>
+              )}
+              {user.role !== 'admin' && (
+                <button
+                  onClick={handleClaimScenes}
+                  disabled={claiming}
+                  className="px-3 py-1 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded text-white text-sm"
+                >
+                  {claiming ? '领取中...' : '领取场景'}
+                </button>
+              )}
+              {onLogout && (
+                <button
+                  onClick={onLogout}
+                  className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded text-gray-300 text-sm"
+                >
+                  登出
+                </button>
+              )}
+            </>
+          )}
+        </div>
       </header>
       
       <div className="flex-1 flex flex-col p-4 overflow-hidden">
@@ -256,6 +341,7 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
             { key: 'pending', label: '待标注', count: stats.pending, cls: 'bg-gray-600' },
             { key: 'aligned', label: '已对齐', count: stats.aligned, cls: 'bg-green-700' },
             { key: 'invalid', label: '无效', count: stats.invalid, cls: 'bg-red-700' },
+            { key: 'align_difficult', label: '对齐困难', count: stats.align_difficult, cls: 'bg-orange-700' },
           ].map(tab => (
             <button
               key={tab.key}
@@ -291,6 +377,34 @@ function MVDataSelector({ onSelect, savedObjectInfo, filterState, onFilterChange
         
         {loading ? (
           <div className="text-gray-400 text-center py-8">加载中...</div>
+        ) : stats.all === 0 && user?.role !== 'admin' ? (
+          /* 没有场景时显示领取引导 */
+          <div className="flex-1 flex flex-col items-center justify-center">
+            <div className="text-center max-w-md">
+              <div className="text-6xl mb-6">📦</div>
+              <h2 className="text-xl text-white font-medium mb-3">
+                {scenes.length === 0 ? '还没有领取场景' : '当前批次已完成'}
+              </h2>
+              <p className="text-gray-400 mb-6">
+                {scenes.length === 0 
+                  ? '点击下方按钮领取标注任务，开始标注工作'
+                  : '恭喜完成当前批次！点击下方按钮领取新的场景继续标注'
+                }
+              </p>
+              <button
+                onClick={handleClaimScenes}
+                disabled={claiming}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 rounded-lg text-white font-medium text-lg"
+              >
+                {claiming ? '领取中...' : '领取场景'}
+              </button>
+              {userStats && (
+                <p className="text-gray-500 text-sm mt-4">
+                  已完成 {userStats.total} 个物体 · 今日 {userStats.today} 个
+                </p>
+              )}
+            </div>
+          </div>
         ) : (
           <>
             {/* 表格 */}
@@ -422,6 +536,53 @@ export function MVPoseAnnotationTool() {
   const setMaskOpacity = useMVAnnotationStore((state) => state.setMaskOpacity);
   const isSavingNext = useMVAnnotationStore((state) => state.isSavingNext);
   
+  // 登录态管理
+  const [isAuthenticated, setIsAuthenticated] = useState(isLoggedIn());
+  const [currentUser, setCurrentUser] = useState<User | null>(getStoredUser());
+  const [userStats, setUserStats] = useState<UserStats | null>(null);
+  
+  // 检查登录状态并获取用户信息
+  useEffect(() => {
+    if (isAuthenticated) {
+      getCurrentUser().then(data => {
+        if (data) {
+          setCurrentUser(data.user);
+          setUserStats(data.stats);
+        } else {
+          // token 无效，需要重新登录
+          setIsAuthenticated(false);
+          setCurrentUser(null);
+        }
+      });
+    }
+  }, [isAuthenticated]);
+  
+  // 监听登出事件
+  useEffect(() => {
+    const handleLogout = () => {
+      setIsAuthenticated(false);
+      setCurrentUser(null);
+      setUserStats(null);
+    };
+    window.addEventListener('auth:logout', handleLogout);
+    return () => window.removeEventListener('auth:logout', handleLogout);
+  }, []);
+  
+  // 登录成功回调
+  const handleLoginSuccess = useCallback(() => {
+    setIsAuthenticated(true);
+    setCurrentUser(getStoredUser());
+  }, []);
+  
+  // 登出回调
+  const handleLogout = useCallback(async () => {
+    await logout();
+    setIsAuthenticated(false);
+    setCurrentUser(null);
+    setUserStats(null);
+    reset();
+  }, [reset]);
+  
   // 用于通知数据选择器更新对象状态
   const [savedObjectInfo, setSavedObjectInfo] = useState<{objectId: string; category: string} | null>(null);
   // 记录当前使用的帧数设置
@@ -471,9 +632,9 @@ export function MVPoseAnnotationTool() {
   
   const handleBack = useCallback(() => {
     // 如果有保存的分类信息，传递给数据选择器
-    // 注意：保存时会自动将非invalid的category设置为fixed
+    // 注意：保存时会自动将非invalid/align_difficult的category设置为fixed
     if (category && currentInput) {
-      const finalCategory = category === 'invalid' ? 'invalid' : 'fixed';
+      const finalCategory = (category === 'invalid' || category === 'align_difficult') ? category : 'fixed';
       setSavedObjectInfo({
         objectId: currentInput.objectId,
         category: finalCategory
@@ -500,7 +661,7 @@ export function MVPoseAnnotationTool() {
       showGlobalToast('已保存当前标注', 'success', 2000);
       
       // 通知数据选择器更新（乐观更新）
-      const finalCategory = store.category === 'invalid' ? 'invalid' : 'fixed';
+      const finalCategory = (store.category === 'invalid' || store.category === 'align_difficult') ? store.category : 'fixed';
       setSavedObjectInfo({
         objectId: store.currentInput!.objectId,
         category: finalCategory
@@ -554,7 +715,7 @@ export function MVPoseAnnotationTool() {
     }
   }, [reset, setCurrentInput, numFrames]);
   
-  // 放弃并处理下一个（标记为无效，保存后跳到下一个）
+  // 放弃并处理下一个（标记为对齐困难，保存后跳到下一个）
   const handleSkipAndNext = useCallback(async () => {
     const store = useMVAnnotationStore.getState();
     if (store.isSavingNext || !store.currentInput) return;
@@ -562,14 +723,14 @@ export function MVPoseAnnotationTool() {
     store.setIsSavingNext(true);
     
     try {
-      // 标记为无效并保存
-      await store.classifyAsInvalid();
-      showGlobalToast('已标记为无效数据', 'warning', 1500);
+      // 标记为对齐困难并保存
+      await store.classifyAsAlignDifficult();
+      showGlobalToast('已标记为对齐困难', 'warning', 1500);
       
       // 通知列表更新
       setSavedObjectInfo({
         objectId: store.currentInput!.objectId,
-        category: 'invalid'
+        category: 'align_difficult'
       });
       
       // 解析当前objectId获取scene_id, object_id
@@ -643,9 +804,24 @@ export function MVPoseAnnotationTool() {
   // 使用计算后的位姿或初始位姿
   const currentPose = calculatedPose ?? currentInput?.initialPose;
   
+  // 未登录时显示登录页面
+  if (!isAuthenticated) {
+    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+  }
+  
   // 没有数据时显示数据选择器
   if (!currentInput) {
-    return <MVDataSelector onSelect={handleDataSelect} savedObjectInfo={savedObjectInfo} filterState={selectorFilter} onFilterChange={handleFilterChange} />;
+    return (
+      <MVDataSelector 
+        onSelect={handleDataSelect} 
+        savedObjectInfo={savedObjectInfo} 
+        filterState={selectorFilter} 
+        onFilterChange={handleFilterChange}
+        user={currentUser}
+        userStats={userStats}
+        onLogout={handleLogout}
+      />
+    );
   }
   
   return (

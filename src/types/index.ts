@@ -44,7 +44,7 @@ export interface PointPair {
 }
 
 // 物体分类状态
-export type ObjectCategory = 'valid' | 'fixed' | 'invalid' | 'unclassified';
+export type ObjectCategory = 'valid' | 'fixed' | 'invalid' | 'align_difficult' | 'unclassified';
 
 // 工作流状态
 export type WorkflowState = 

@@ -20,6 +20,10 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
   const selectPointPair = useMVAnnotationStore((state) => state.selectPointPair);
   const isSavingNext = useMVAnnotationStore((state) => state.isSavingNext);
   const remainingCount = useMVAnnotationStore((state) => state.remainingCount);
+  const calculatedPose = useMVAnnotationStore((state) => state.calculatedPose);
+  
+  // 当有 calculatedPose（bbox align 或点对对齐）时即可保存
+  const canSave = !!calculatedPose;
   
   return (
     <div className="h-full bg-gray-800 rounded-lg p-4 flex flex-col gap-4 overflow-y-auto">
@@ -95,19 +99,19 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
             RANSAC 对齐{pointPairs.length < 5 ? ` (需${5 - pointPairs.length}点)` : ''}
           </button>
           
-          {/* 保存并处理下一个 - 需要>=3点 */}
+          {/* 保存并处理下一个 - 有 pose 即可保存（bbox align 或点对对齐） */}
           {onSaveAndNext && (
             <button
               onClick={onSaveAndNext}
-              disabled={isSavingNext || pointPairs.length < 3}
+              disabled={isSavingNext || !canSave}
               className={`w-full px-4 py-3 rounded font-semibold transition-colors ${
-                isSavingNext || pointPairs.length < 3
+                isSavingNext || !canSave
                   ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
                   : 'bg-green-600 hover:bg-green-500 text-white'
               }`}
             >
-              {isSavingNext ? '处理中...' : pointPairs.length < 3 ? `保存并下一个 (需${3 - pointPairs.length}点)` : '保存并处理下一个'}
-              {remainingCount !== null && !isSavingNext && pointPairs.length >= 3 && (
+              {isSavingNext ? '处理中...' : !canSave ? '保存并下一个 (无pose)' : pointPairs.length === 0 ? '保存 Bbox Align 并下一个' : '保存并处理下一个'}
+              {remainingCount !== null && !isSavingNext && canSave && (
                 <span className="ml-2 px-1.5 py-0.5 bg-white/20 rounded-full text-xs">
                   剩余 {remainingCount}
                 </span>
@@ -126,7 +130,7 @@ export function MVControlPanel({ onSaveAndNext, onSkipAndNext }: MVControlPanelP
                   : 'bg-gray-600 hover:bg-gray-500 text-gray-200'
               }`}
             >
-              {isSavingNext ? '处理中...' : '放弃并处理下一个'}
+              {isSavingNext ? '处理中...' : '放弃并标记对齐困难'}
             </button>
           )}
         </div>

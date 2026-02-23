@@ -22,6 +22,7 @@ import {
   identity4,
   multiply4x4
 } from '../utils/math';
+import { getAuthHeaders } from '../utils/api';
 
 // Get API base path from Vite's BASE_URL
 const getApiBasePath = () => {
@@ -97,6 +98,7 @@ interface MVAnnotationStore {
   classifyAsValid: () => void;
   classifyAsFixed: () => void;
   classifyAsInvalid: () => void;
+  classifyAsAlignDifficult: () => void;
   
   // ========== 保存 ==========
   savePose: () => Promise<{ success: boolean; pose_path?: string; error?: string }>;
@@ -148,6 +150,13 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     // 如果有恢复的点对且>=3个，自动运行对齐
     if (restoredPairs.length >= 3) {
       get().runAlignment(false);
+    } else {
+      // 没有恢复的点对时，自动应用 bbox align 作为初始投影
+      const state = get();
+      if (state.currentInput?.meshInfo && state.currentInput?.gtBbox) {
+        state.applyBboxAlign();
+        console.log('[setCurrentInput] 自动应用 bbox align 作为初始投影');
+      }
     }
   },
   
@@ -478,6 +487,19 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     }
   },
   
+  classifyAsAlignDifficult: async () => {
+    set({
+      category: 'align_difficult',
+      workflowState: 'review'
+    });
+    
+    // 自动保存对齐困难分类
+    const state = get();
+    if (state.currentInput) {
+      await state.savePose();
+    }
+  },
+  
   // ========== 保存Pose到服务器 ==========
   savePose: async () => {
     const state = get();
@@ -498,8 +520,10 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
     const scene_id = parts[0];
     const object_id = parts.slice(1).join('_');
     
-    // 如果不是invalid，保存时自动设置为fixed（已对齐）
-    const finalCategory = state.category === 'invalid' ? 'invalid' : 'fixed';
+    // 保存时根据分类状态决定 finalCategory
+    const finalCategory = (state.category === 'invalid' || state.category === 'align_difficult') 
+      ? state.category 
+      : 'fixed';
     
     const requestData = {
       scene_id,
@@ -523,9 +547,7 @@ export const useMVAnnotationStore = create<MVAnnotationStore>((set, get) => ({
       const apiPath = `${getApiBasePath()}/api/save_mv_pose`;
       const response = await fetch(apiPath, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
+        headers: getAuthHeaders(),
         body: JSON.stringify(requestData)
       });
       

@@ -36,6 +36,7 @@ export default defineConfig({
       input: {
         main: path.resolve(__dirname, 'index.html'),
         mv: path.resolve(__dirname, 'index-mv.html'),
+        admin: path.resolve(__dirname, 'index-admin.html'),
       },
     },
   },

@@ -18,6 +18,9 @@ from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# 导入数据库模块
+import db
+
 # 渲染服务（懒加载）
 _render_service = None
 def get_render_service():
@@ -31,7 +34,9 @@ def get_render_service():
 # 数据路径配置
 DATA_ROOT = "/root/csz/data_partcrafter"
 LASA1M_ROOT = f"{DATA_ROOT}/LASA1M"
-MV_RECON_ROOT = "/root/csz/yingbo/MV-SAM3D/reconstruction_lasa1m"
+MV_RECON_ROOT = "/root/csz/yingbo/MV-SAM3D/reconstruction_lasa1m_v4"
+MV_SAM_V3_ROOT = f"{DATA_ROOT}/LASA1M_MV_SAM_v3"
+ANNOTATE_ROOT = f"{DATA_ROOT}/LASA1M_ANNOTATE"
 MV_ALIGNED_ROOT = f"{DATA_ROOT}/LASA1M_ALIGNED_MV"  # 多视角对齐结果保存目录
 
 # 全局缓存
@@ -53,13 +58,127 @@ _image_size_cache = {}  # key: image_path -> (width, height)
 class MVDataAPIHandler(SimpleHTTPRequestHandler):
     """多视角数据API处理器"""
     
+    def get_current_user(self):
+        """从请求头获取当前用户，返回 (user_dict, error_msg)"""
+        auth_header = self.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return None, 'Missing or invalid Authorization header'
+        token = auth_header[7:]
+        user = db.get_user_by_token(token)
+        if not user:
+            return None, 'Invalid or expired token'
+        if not user.get('is_active'):
+            return None, 'User account is disabled'
+        return user, None
+    
+    def require_auth(self):
+        """要求认证，返回用户或发送401错误"""
+        user, error = self.get_current_user()
+        if not user:
+            self.send_json({'error': error, 'code': 'UNAUTHORIZED'}, 401)
+            return None
+        return user
+    
+    def require_admin(self):
+        """要求管理员权限，返回用户或发送错误"""
+        user = self.require_auth()
+        if not user:
+            return None
+        if user.get('role') != 'admin':
+            self.send_json({'error': 'Admin access required', 'code': 'FORBIDDEN'}, 403)
+            return None
+        return user
+    
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
         
         # API路由
-        if path == '/api/aligned_objects':
+        # ========== 认证相关 ==========
+        if path == '/api/auth/me':
+            user = self.require_auth()
+            if user:
+                stats = db.get_user_stats(user['id'])
+                active_scenes = db.get_user_active_scenes(user['id'])
+                self.send_json({
+                    'user': user,
+                    'stats': stats,
+                    'active_scenes': active_scenes
+                })
+        
+        # ========== 管理员API ==========
+        elif path == '/api/admin/users':
+            user = self.require_admin()
+            if user:
+                users = db.get_all_user_stats()
+                self.send_json({'users': users})
+        
+        elif path == '/api/admin/assignments':
+            user = self.require_admin()
+            if user:
+                user_id = query.get('user_id', [None])[0]
+                status = query.get('status', [None])[0]
+                user_id = int(user_id) if user_id else None
+                assignments = db.get_all_assignments(user_id, status)
+                self.send_json({'assignments': assignments})
+        
+        elif path == '/api/admin/stats':
+            user = self.require_admin()
+            if user:
+                users_stats = db.get_all_user_stats()
+                # 获取所有场景统计
+                all_scenes = self._get_all_scenes()
+                active_assignments = db.get_all_assignments(status='active')
+                completed_assignments = db.get_all_assignments(status='completed')
+                assigned_scenes = {a['scene_id'] for a in active_assignments}
+                completed_scenes = {a['scene_id'] for a in completed_assignments}
+                
+                self.send_json({
+                    'users': users_stats,
+                    'scenes': {
+                        'total': len(all_scenes),
+                        'assigned': len(assigned_scenes),
+                        'completed': len(completed_scenes),
+                        'unassigned': len(set(all_scenes) - assigned_scenes - completed_scenes)
+                    }
+                })
+        
+        elif path == '/api/admin/logs':
+            user = self.require_admin()
+            if user:
+                user_id = query.get('user_id', [None])[0]
+                date_from = query.get('date_from', [None])[0]
+                date_to = query.get('date_to', [None])[0]
+                limit = int(query.get('limit', [100])[0])
+                offset = int(query.get('offset', [0])[0])
+                user_id = int(user_id) if user_id else None
+                
+                logs = db.get_annotation_logs(user_id, date_from, date_to, limit, offset)
+                total = db.get_logs_count(user_id, date_from, date_to)
+                self.send_json({'logs': logs, 'total': total})
+        
+        elif path == '/api/admin/scenes':
+            user = self.require_admin()
+            if user:
+                # 返回所有场景及其状态
+                all_scenes = self._get_all_scenes()
+                active_assignments = db.get_all_assignments(status='active')
+                completed_assignments = db.get_all_assignments(status='completed')
+                
+                scene_status = {}
+                for s in all_scenes:
+                    scene_status[s] = {'status': 'unassigned', 'user': None}
+                for a in active_assignments:
+                    scene_status[a['scene_id']] = {'status': 'active', 'user': a['username'], 'user_id': a['user_id']}
+                for a in completed_assignments:
+                    if a['scene_id'] in scene_status and scene_status[a['scene_id']]['status'] == 'unassigned':
+                        scene_status[a['scene_id']] = {'status': 'completed', 'user': a['username']}
+                
+                self.send_json({'scenes': scene_status})
+        
+        # ========== 原有API ==========
+        elif path == '/api/aligned_objects':
             self.handle_list_aligned_objects()
         elif path == '/api/refresh_cache':
             # 增量刷新缓存 - 只更新有变化的对象
@@ -160,12 +279,95 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         body = self.rfile.read(content_length)
         
         try:
-            data = json.loads(body.decode('utf-8'))
+            data = json.loads(body.decode('utf-8')) if body else {}
         except json.JSONDecodeError:
             self.send_json({'error': 'Invalid JSON'}, 400)
             return
         
-        if path == '/api/save_mv_pose':
+        # ========== 认证API ==========
+        if path == '/api/auth/login':
+            username = data.get('username', '')
+            password = data.get('password', '')
+            user = db.verify_user(username, password)
+            if user:
+                token = db.create_token(user['id'])
+                self.send_json({
+                    'success': True,
+                    'token': token,
+                    'user': user
+                })
+            else:
+                self.send_json({'success': False, 'error': 'Invalid username or password'}, 401)
+        
+        elif path == '/api/auth/logout':
+            auth_header = self.headers.get('Authorization', '')
+            if auth_header.startswith('Bearer '):
+                token = auth_header[7:]
+                db.revoke_token(token)
+            self.send_json({'success': True})
+        
+        # ========== 管理员API ==========
+        elif path == '/api/admin/users':
+            user = self.require_admin()
+            if user:
+                username = data.get('username')
+                password = data.get('password')
+                batch_size = data.get('batch_size', 5)
+                role = data.get('role', 'annotator')
+                
+                if not username or not password:
+                    self.send_json({'error': 'Username and password required'}, 400)
+                    return
+                
+                user_id = db.create_user(username, password, role, batch_size)
+                if user_id:
+                    self.send_json({'success': True, 'user_id': user_id})
+                else:
+                    self.send_json({'error': 'Username already exists'}, 400)
+        
+        elif path.startswith('/api/admin/users/'):
+            user = self.require_admin()
+            if user:
+                # 解析用户ID: /api/admin/users/123
+                try:
+                    target_user_id = int(path.split('/')[-1])
+                except ValueError:
+                    self.send_json({'error': 'Invalid user ID'}, 400)
+                    return
+                
+                updates = {}
+                if 'password' in data:
+                    updates['password'] = data['password']
+                if 'batch_size' in data:
+                    updates['batch_size'] = data['batch_size']
+                if 'is_active' in data:
+                    updates['is_active'] = 1 if data['is_active'] else 0
+                if 'role' in data:
+                    updates['role'] = data['role']
+                
+                if updates:
+                    success = db.update_user(target_user_id, **updates)
+                    self.send_json({'success': success})
+                else:
+                    self.send_json({'error': 'No valid fields to update'}, 400)
+        
+        # ========== 原有API ==========
+        elif path == '/api/claim_scenes':
+            # 标注员自助领取场景（强制增量领取）
+            user = self.require_auth()
+            if not user:
+                return
+            
+            assigned = self._assign_scenes_to_user(user)
+            active_scenes = db.get_user_active_scenes(user['id'])
+            
+            self.send_json({
+                'success': True,
+                'assigned': assigned or [],
+                'active_scenes': active_scenes,
+                'message': f'已领取 {len(assigned) if assigned else 0} 个新场景' if assigned else '没有可领取的场景'
+            })
+        elif path == '/api/save_mv_pose':
             self.handle_save_mv_pose(data)
         elif path == '/api/render_mesh':
             self.handle_render_mesh(data)
@@ -238,6 +440,16 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         # 立即更新缓存，避免 next_mv_task 重复返回已标注物体
         self._update_single_object_cache(scene_id, object_id)
         
+        # 记录标注日志（只记录成功对齐的，invalid 和 align_difficult 不计入统计）
+        user, _ = self.get_current_user()
+        if user:
+            if category == 'fixed':
+                # 只有成功对齐的才记录到统计
+                db.log_annotation(user['id'], scene_id, object_id, category, 'align')
+            
+            # 检查场景是否完成
+            self._check_and_complete_scene(user['id'], scene_id)
+        
         self.send_json({
             'success': True,
             'pose_path': pose_path,
@@ -304,19 +516,36 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             _mv_objects_cache_time = current_time
             print(f"[handle_list_mv_objects] 缓存构建完成，耗时 {time.time() - start_time:.2f}s，共 {len(_mv_objects_cache)} 个物体")
         
+        # 获取当前用户
+        user, _ = self.get_current_user()
+        is_admin = user and user.get('role') == 'admin'
+        
+        # 获取用户的活跃场景（非管理员只能看到分配给自己的场景）
+        user_scenes = None
+        if user and not is_admin:
+            user_scenes = set(db.get_user_active_scenes(user['id']))
+            # 不再自动领取，由用户手动点击"领取场景"按钮
+        
         # 应用场景过滤
         filtered = list(_mv_objects_cache)  # copy
+        
+        # 非管理员只能看到分配给自己的场景
+        if user_scenes is not None:
+            filtered = [o for o in filtered if o['scene_id'] in user_scenes]
+        
         if scene_filter:
             filtered = [o for o in filtered if o['scene_id'] == scene_filter]
         
         # 应用状态过滤
         if status_filter:
             if status_filter == 'pending':
-                filtered = [o for o in filtered if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid')]
+                filtered = [o for o in filtered if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid', 'align_difficult')]
             elif status_filter == 'aligned':
-                filtered = [o for o in filtered if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') != 'invalid')]
+                filtered = [o for o in filtered if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') not in ('invalid', 'align_difficult'))]
             elif status_filter == 'invalid':
                 filtered = [o for o in filtered if o.get('category') == 'invalid']
+            elif status_filter == 'align_difficult':
+                filtered = [o for o in filtered if o.get('category') == 'align_difficult']
         
         # 应用排序
         reverse = (sort_order == 'desc')
@@ -328,11 +557,15 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             filtered.sort(key=lambda x: x.get('saved_at') or '', reverse=reverse)
         # 默认不额外排序，保持 scene_id + object_id 顺序
         
-        # 统计各状态数量
-        all_count = len(_mv_objects_cache)
-        pending_count = sum(1 for o in _mv_objects_cache if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid'))
-        aligned_count = sum(1 for o in _mv_objects_cache if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') != 'invalid'))
-        invalid_count = sum(1 for o in _mv_objects_cache if o.get('category') == 'invalid')
+        # 用户可见的物体列表（用于统计，不受状态过滤影响）
+        user_objects = [o for o in _mv_objects_cache if user_scenes is None or o['scene_id'] in user_scenes]
+        
+        # 统计各状态数量（基于用户可见的物体）
+        all_count = len(user_objects)
+        pending_count = sum(1 for o in user_objects if not o.get('has_alignment') and o.get('category') not in ('fixed', 'invalid', 'align_difficult'))
+        aligned_count = sum(1 for o in user_objects if o.get('category') == 'fixed' or (o.get('has_alignment') and o.get('category') not in ('invalid', 'align_difficult')))
+        invalid_count = sum(1 for o in user_objects if o.get('category') == 'invalid')
+        align_difficult_count = sum(1 for o in user_objects if o.get('category') == 'align_difficult')
         
         total = len(filtered)
         
@@ -341,8 +574,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         end_idx = start_idx + page_size
         page_data = filtered[start_idx:end_idx]
         
-        # 获取所有场景ID列表（用于前端筛选）
-        all_scenes = sorted(set(o['scene_id'] for o in _mv_objects_cache))
+        # 获取场景ID列表（用于前端筛选，基于用户可见的物体）
+        all_scenes = sorted(set(o['scene_id'] for o in user_objects))
         
         self.send_json({
             'mv_objects': page_data,
@@ -355,7 +588,8 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'all': all_count,
                 'pending': pending_count,
                 'aligned': aligned_count,
-                'invalid': invalid_count
+                'invalid': invalid_count,
+                'align_difficult': align_difficult_count
             }
         })
     
@@ -443,9 +677,9 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
     def handle_next_mv_task(self, current_scene_id, exclude_object_id):
         """
         获取下一个待标注的多视角物体。
-        优先返回同场景的物体，其次返回其他场景的物体。
         
-        "待标注"定义：在 MV_RECON_ROOT 中有 mesh 但在 MV_ALIGNED_ROOT 中没有对应 result.json 的物体。
+        对于普通用户：只从分配给自己的场景中获取任务，如果当前批次完成则自动领取新场景。
+        对于管理员：可以看到所有待标注物体。
         """
         global _mv_objects_cache, _mv_objects_cache_time
         
@@ -455,7 +689,17 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             _mv_objects_cache = self._build_mv_objects_cache()
             _mv_objects_cache_time = current_time
         
-        # 筛选待标注物体：没有对齐结果且未被标记为invalid的
+        # 获取当前用户
+        user, _ = self.get_current_user()
+        is_admin = user and user.get('role') == 'admin'
+        
+        # 获取用户的活跃场景
+        user_scenes = None
+        if user and not is_admin:
+            user_scenes = set(db.get_user_active_scenes(user['id']))
+            # 不再自动领取，由用户手动点击"领取场景"按钮
+        
+        # 筛选待标注物体
         pending_objects = []
         for obj in _mv_objects_cache:
             # 排除当前正在标注的物体
@@ -463,8 +707,12 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 obj['object_id'] == exclude_object_id):
                 continue
             
-            # 跳过已标注的（has_alignment=True 表示已有对齐结果）
-            if obj.get('has_alignment') or obj.get('category') in ('fixed', 'invalid'):
+            # 跳过已标注的
+            if obj.get('has_alignment') or obj.get('category') in ('fixed', 'invalid', 'align_difficult'):
+                continue
+            
+            # 非管理员只能看到分配给自己的场景
+            if user_scenes is not None and obj['scene_id'] not in user_scenes:
                 continue
             
             pending_objects.append({
@@ -472,6 +720,15 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'object_id': obj['object_id'],
                 'is_same_scene': obj['scene_id'] == current_scene_id
             })
+        
+        # 如果当前批次没有待标注物体，标记已完成的场景（但不自动领取新场景）
+        if not pending_objects and user and not is_admin:
+            # 标记已完成的场景
+            if user_scenes:
+                for scene_id in user_scenes:
+                    if self._is_scene_completed(scene_id):
+                        db.mark_scene_completed(user['id'], scene_id)
+            # 不再自动领取，由用户手动点击"领取场景"按钮
         
         if not pending_objects:
             self.send_json({
@@ -494,7 +751,7 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         remaining_count = len(pending_objects)
         
         print(f"[next_mv_task] 下一个任务: scene={next_task['scene_id']}, "
-              f"object={next_task['object_id']}, remaining={remaining_count}")
+              f"object={next_task['object_id']}, remaining={remaining_count}, user={user['username'] if user else 'anonymous'}")
         
         self.send_json({
             'success': True,
@@ -506,12 +763,95 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'remaining_count': remaining_count
         })
     
+    def _get_all_scenes(self):
+        """获取所有场景ID列表"""
+        global _mv_objects_cache
+        if _mv_objects_cache:
+            return sorted(set(obj['scene_id'] for obj in _mv_objects_cache))
+        
+        # 从目录获取
+        scenes = []
+        for scene_dir in glob.glob(f"{MV_SAM_V3_ROOT}/*"):
+            if os.path.isdir(scene_dir):
+                scenes.append(os.path.basename(scene_dir))
+        return sorted(scenes)
+    
+    def _is_scene_completed(self, scene_id):
+        """检查场景是否已完成（所有物体都已标注）"""
+        global _mv_objects_cache
+        if not _mv_objects_cache:
+            return False
+        
+        for obj in _mv_objects_cache:
+            if obj['scene_id'] != scene_id:
+                continue
+            # 如果有任何物体未标注，场景未完成
+            if not obj.get('has_alignment') and obj.get('category') not in ('fixed', 'invalid', 'align_difficult'):
+                return False
+        return True
+    
+    def _assign_scenes_to_user(self, user, count=None, force_add=False):
+        """为用户分配场景
+        
+        Args:
+            user: 用户信息
+            count: 要领取的数量（默认使用 batch_size）
+            force_add: 如果为 True，则强制增量领取 count 个；否则补齐到 batch_size
+        
+        Returns:
+            list: 新分配的场景ID列表
+        """
+        if not user:
+            return []
+        
+        user_id = user['id']
+        batch_size = count if count else user.get('batch_size', 5)
+        
+        # 获取当前活跃场景数
+        active_scenes = db.get_user_active_scenes(user_id)
+        
+        if force_add:
+            # 强制增量领取指定数量
+            need_count = batch_size
+        else:
+            # 补齐到 batch_size
+            need_count = batch_size - len(active_scenes)
+        
+        if need_count <= 0:
+            return []
+        
+        # 获取所有场景
+        all_scenes = self._get_all_scenes()
+        
+        # 获取未分配的场景（只选择有待标注物体的场景）
+        unassigned = db.get_unassigned_scenes(all_scenes, need_count * 2)  # 多取一些以便筛选
+        
+        # 筛选出有待标注物体的场景
+        scenes_to_assign = []
+        for scene_id in unassigned:
+            if not self._is_scene_completed(scene_id):
+                scenes_to_assign.append(scene_id)
+                if len(scenes_to_assign) >= need_count:
+                    break
+        
+        if scenes_to_assign:
+            assigned_count = db.assign_scenes_to_user(user_id, scenes_to_assign)
+            print(f"[assign_scenes] 为用户 {user['username']} 分配了 {assigned_count} 个场景: {scenes_to_assign}")
+            return scenes_to_assign
+        return []
+    
+    def _check_and_complete_scene(self, user_id, scene_id):
+        """检查场景是否完成，如果完成则标记"""
+        if self._is_scene_completed(scene_id):
+            db.mark_scene_completed(user_id, scene_id)
+            print(f"[complete_scene] 场景 {scene_id} 已完成")
+    
     def _build_mv_objects_cache(self):
-        """构建物体列表缓存（包含缩略图、标注统计等信息）"""
+        """构建物体列表缓存（基于 v3 mask/image 数据，检查 v4 mesh 存在）"""
         mv_objects = []
         
-        # 遍历多视角重建目录
-        for scene_dir in sorted(glob.glob(f"{MV_RECON_ROOT}/*")):
+        # 遍历 MV_SAM_V3 目录
+        for scene_dir in sorted(glob.glob(f"{MV_SAM_V3_ROOT}/*")):
             if not os.path.isdir(scene_dir):
                 continue
             scene_id = os.path.basename(scene_dir)
@@ -520,24 +860,26 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 if not os.path.isdir(obj_dir):
                     continue
                 object_id = os.path.basename(obj_dir)
-                
-                # 检查是否有mesh文件
-                mesh_path = f"{obj_dir}/mesh.glb"
-                if not os.path.exists(mesh_path):
+                if object_id in ("vis", "images"):
                     continue
                 
-                # 检查LASA1M中是否有对应数据（只检查目录存在）
-                lasa_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}"
-                if not os.path.exists(lasa_path):
+                # 必须有 v3 metadata
+                meta_path = f"{obj_dir}/frame_selection_metadata.json"
+                if not os.path.exists(meta_path):
                     continue
                 
-                # 获取缩略图URL（第一张RGB图）
+                # 检查 v4 mesh（可选，重建中的物体也列出但标记无mesh）
+                mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
+                has_mesh = os.path.exists(mesh_path)
+                
+                # 获取缩略图URL（v3 第一张 image）
                 thumbnail_url = None
-                rgb_dir = f"{lasa_path}/raw_jpg"
-                rgb_files = sorted(glob.glob(f"{rgb_dir}/*.jpg"))
-                if rgb_files:
-                    first_frame = os.path.basename(rgb_files[0])
-                    thumbnail_url = f"/data/image/{scene_id}/{object_id}/raw_jpg/{first_frame}"
+                v3_images_dir = f"{obj_dir}/images"
+                if os.path.isdir(v3_images_dir):
+                    img_files = sorted(glob.glob(f"{v3_images_dir}/*.png"))
+                    if img_files:
+                        first_idx = os.path.basename(img_files[0]).replace('.png', '')
+                        thumbnail_url = f"/data/v3_image/{scene_id}/{object_id}/{first_idx}.png"
                 
                 # 检查是否已有对齐结果和分类状态
                 aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
@@ -564,6 +906,7 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                     'scene_id': scene_id,
                     'object_id': object_id,
                     'num_frames': -1,  # 延迟加载
+                    'has_mesh': has_mesh,
                     'has_alignment': has_alignment,
                     'category': category,
                     'thumbnail_url': thumbnail_url,
@@ -713,18 +1056,19 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         return size
     
     def _get_instances(self, scene_id):
-        """获取场景的 instances.json（带缓存）"""
+        """获取场景的 instances.json（带缓存，优先 ANNOTATE，fallback LASA1M）"""
         if scene_id in _instances_cache:
             return _instances_cache[scene_id]
-        instances_path = f"{LASA1M_ROOT}/{scene_id}/instances.json"
-        if os.path.exists(instances_path):
-            try:
-                with open(instances_path, 'r') as f:
-                    data = json.load(f)
-                _instances_cache[scene_id] = data
-                return data
-            except:
-                pass
+        for base in (ANNOTATE_ROOT, LASA1M_ROOT):
+            instances_path = f"{base}/{scene_id}/instances.json"
+            if os.path.exists(instances_path):
+                try:
+                    with open(instances_path, 'r') as f:
+                        data = json.load(f)
+                    _instances_cache[scene_id] = data
+                    return data
+                except:
+                    pass
         _instances_cache[scene_id] = []
         return []
     
@@ -762,72 +1106,66 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         return mesh_info
     
     def load_mv_object_data(self, scene_id, object_id, num_frames=8):
-        """加载多视角物体数据（优化版：使用多级缓存）"""
+        """加载多视角物体数据（v3 固定帧 + ANNOTATE depth/info）"""
         # 1. 检查mesh文件
         mesh_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/mesh.glb"
         if not os.path.exists(mesh_path):
             raise FileNotFoundError(f"Mesh not found: {mesh_path}")
         mesh_url = f"/data/mv_mesh/{scene_id}/{object_id}/mesh.glb"
         
-        # 2. 加载info.json获取所有帧的相机参数
-        info_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/info.json"
-        if not os.path.exists(info_path):
-            raise FileNotFoundError(f"info.json not found: {info_path}")
+        # 2. 加载 v3 frame_selection_metadata（固定帧列表）
+        v3_meta_path = f"{MV_SAM_V3_ROOT}/{scene_id}/{object_id}/frame_selection_metadata.json"
+        if not os.path.exists(v3_meta_path):
+            raise FileNotFoundError(f"v3 metadata not found: {v3_meta_path}")
         
-        with open(info_path) as f:
-            info = json.load(f)
+        with open(v3_meta_path) as f:
+            v3_metadata = json.load(f)
         
-        # 3. 获取所有RGB文件并按时间戳排序
-        rgb_dir = f"{LASA1M_ROOT}/{scene_id}/{object_id}/raw_jpg"
-        rgb_files = sorted(glob.glob(f"{rgb_dir}/*.jpg"))
-        if not rgb_files:
-            raise FileNotFoundError(f"No RGB files found in {rgb_dir}")
+        if not isinstance(v3_metadata, list) or not v3_metadata:
+            raise ValueError(f"Empty v3 metadata: {v3_meta_path}")
         
-        # 4. 两阶段帧选择
-        total_frames = len(rgb_files)
-        SAMPLE_POOL_SIZE = 12
+        # 3. 加载 info.json 获取相机参数（优先 ANNOTATE，fallback LASA1M, v2）
+        info = None
+        for base in (ANNOTATE_ROOT, LASA1M_ROOT, f"{DATA_ROOT}/LASA1M_v2"):
+            info_path = f"{base}/{scene_id}/{object_id}/info.json"
+            if os.path.exists(info_path):
+                with open(info_path) as f:
+                    info = json.load(f)
+                break
+        if info is None:
+            raise FileNotFoundError(f"info.json not found for {scene_id}/{object_id}")
         
-        if total_frames <= num_frames:
-            selected_indices = list(range(total_frames))
-        elif total_frames <= SAMPLE_POOL_SIZE:
-            selected_indices = list(range(total_frames))
-        else:
-            step = total_frames / SAMPLE_POOL_SIZE
-            selected_indices = [int(i * step) for i in range(SAMPLE_POOL_SIZE)]
-        
-        # 5. 构建帧数据
-        frames = []
         timestamp_to_info = {item.get('timestamp'): item for item in info if item.get('timestamp')}
         depth_width, depth_height = 512, 384
         
-        # 预扫描 gt 目录（一次性，而非每帧重复 glob）
-        gt_dir_base = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt"
-        gt_timestamps_map = {}
-        if os.path.isdir(gt_dir_base):
-            for d in os.listdir(gt_dir_base):
-                try:
-                    gt_timestamps_map[int(d)] = d
-                except ValueError:
-                    pass
-        gt_ts_list = sorted(gt_timestamps_map.keys()) if gt_timestamps_map else []
+        # 4. 构建帧数据（使用 v3 固定帧，最多 num_frames 帧）
+        total_frames = len(v3_metadata)
+        selected_entries = v3_metadata[:num_frames] if len(v3_metadata) > num_frames else v3_metadata
         
-        for idx in selected_indices:
-            rgb_path = rgb_files[idx]
-            frame_id = os.path.basename(rgb_path).replace('.jpg', '')
-            frame_timestamp = int(frame_id)
+        frames = []
+        for entry in selected_entries:
+            idx = entry.get("index", 0)
+            ts = entry.get("timestamp")
+            if ts is None:
+                continue
             
-            # 获取相机参数
-            frame_info = timestamp_to_info.get(frame_timestamp)
-            if not frame_info:
-                timestamps = list(timestamp_to_info.keys())
-                if timestamps:
-                    closest_ts = min(timestamps, key=lambda t: abs(t - frame_timestamp))
-                    frame_info = timestamp_to_info[closest_ts]
-            if not frame_info:
+            # v3 RGB image
+            rgb_path = f"{MV_SAM_V3_ROOT}/{scene_id}/{object_id}/images/{idx}.png"
+            if not os.path.exists(rgb_path):
                 continue
             
             # 获取图像尺寸（缓存）
             image_width, image_height = self._get_image_size(rgb_path)
+            
+            # 相机参数
+            frame_info = timestamp_to_info.get(ts)
+            if not frame_info:
+                timestamps = list(timestamp_to_info.keys())
+                if timestamps:
+                    closest_ts = min(timestamps, key=lambda t: abs(t - ts))
+                    frame_info = timestamp_to_info[closest_ts]
+            if not frame_info:
+                continue
             
             K = frame_info.get('gt_depth_K')
             RT = frame_info.get('gt_RT')
@@ -842,40 +1180,38 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                     [K[2][0], K[2][1], K[2][2]]
                 ]
             
-            # mask
-            mask_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/mask/{frame_id}.png"
-            mask_subdir = 'mask'
+            # v3 mask
+            mask_path = f"{MV_SAM_V3_ROOT}/{scene_id}/{object_id}/{object_id}/{idx}.png"
             mask_exists = os.path.exists(mask_path)
             
-            # mask比例（用缓存的图像尺寸避免重复读取）
-            mask_ratio = 0.0
-            if mask_exists:
-                try:
-                    from PIL import Image
-                    with Image.open(mask_path) as mask_img:
-                        mask_array = np.array(mask_img)
-                        if len(mask_array.shape) == 3:
-                            mask_array = mask_array[:, :, 0]
-                        mask_pixels = np.sum(mask_array > 128)
-                        total_pixels = mask_array.shape[0] * mask_array.shape[1]
-                        mask_ratio = mask_pixels / total_pixels if total_pixels > 0 else 0.0
-                except:
-                    pass
+            # mask比例
+            mask_ratio = entry.get("mask_ratio", 0.0)
+            if mask_ratio == 0.0 and mask_exists:
+                from PIL import Image
+                with Image.open(mask_path) as mask_img:
+                    mask_array = np.array(mask_img)
+                    if len(mask_array.shape) == 3:
+                        mask_array = mask_array[:, :, 0]
+                    mask_pixels = np.sum(mask_array > 128)
+                    total_pixels = mask_array.shape[0] * mask_array.shape[1]
+                    mask_ratio = mask_pixels / total_pixels if total_pixels > 0 else 0.0
             
-            # 深度图（使用预扫描的 gt 目录）
+            # depth（优先 ANNOTATE，fallback 旧路径）
             depth_url = None
-            if gt_ts_list:
-                closest_idx = min(range(len(gt_ts_list)), key=lambda i: abs(gt_ts_list[i] - frame_timestamp))
-                actual_gt_frame = gt_timestamps_map[gt_ts_list[closest_idx]]
-                depth_path = f"{gt_dir_base}/{actual_gt_frame}/depth.png"
-                if os.path.exists(depth_path):
-                    depth_url = f"/data/depth/{scene_id}/{object_id}/{actual_gt_frame}"
+            annotate_depth = f"{ANNOTATE_ROOT}/{scene_id}/{object_id}/depth/{idx}.png"
+            if os.path.exists(annotate_depth):
+                depth_url = f"/data/annotate_depth/{scene_id}/{object_id}/{idx}"
+            else:
+                # fallback: 旧 LASA1M gt 路径
+                gt_depth = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt/{ts}/depth.png"
+                if os.path.exists(gt_depth):
+                    depth_url = f"/data/depth/{scene_id}/{object_id}/{ts}"
             
             frames.append({
-                'frame_id': frame_id,
+                'frame_id': str(ts),
                 'frame_index': idx,
-                'rgb_url': f"/data/image/{scene_id}/{object_id}/raw_jpg/{frame_id}.jpg",
-                'mask_url': f"/data/image/{scene_id}/{object_id}/{mask_subdir}/{frame_id}.png" if mask_exists else None,
+                'rgb_url': f"/data/v3_image/{scene_id}/{object_id}/{idx}.png",
+                'mask_url': f"/data/v3_mask/{scene_id}/{object_id}/{idx}.png" if mask_exists else None,
                 'depth_url': depth_url,
                 'mask_ratio': mask_ratio,
                 'camera_intrinsics': {
@@ -887,14 +1223,10 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 'camera_extrinsics': RT
             })
         
-        # 6. 按mask比例降序排序，选择mask最大的num_frames帧
-        frames.sort(key=lambda f: f.get('mask_ratio', 0), reverse=True)
-        if len(frames) > num_frames:
-            frames = frames[:num_frames]
         for i, frame in enumerate(frames):
             frame['frame_index'] = i
         
-        # 7. 加载已有的world_pose（检测 mesh 是否比对齐数据更新）
+        # 5. 加载已有的world_pose（检测 mesh 是否比对齐数据更新）
         world_pose = None
         aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/world_pose.npy"
         mesh_mtime = os.path.getmtime(mesh_path)
@@ -902,14 +1234,15 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
         if os.path.exists(aligned_path):
             aligned_mtime = os.path.getmtime(aligned_path)
             if mesh_mtime > aligned_mtime:
-                # mesh 文件比对齐数据新，对齐数据已过期
                 alignment_stale = True
                 print(f"[load_mv_object_data] ⚠️ mesh 已更新 (mesh={mesh_mtime:.0f} > aligned={aligned_mtime:.0f})，丢弃旧对齐数据: {scene_id}/{object_id}")
             else:
                 world_pose = np.load(aligned_path).tolist()
         
-        # 8. 读取GT bbox（缓存 instances.json）
+        # 6. 读取GT bbox + category（缓存 instances.json）
         gt_bbox = None
+        obj_category = None
+        obj_caption = None
         instances = self._get_instances(scene_id)
         for inst in instances:
             if inst.get('id') == object_id:
@@ -919,15 +1252,17 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                     'R': inst.get('R'),
                     'corners': inst.get('corners')
                 }
+                obj_category = inst.get('category')
+                obj_caption = inst.get('caption')
                 break
         
-        # 9. mesh_info（缓存 trimesh.load，但 mesh 更新时需清缓存）
+        # 7. mesh_info（缓存 trimesh.load，但 mesh 更新时需清缓存）
         if alignment_stale:
             cache_key = f"{scene_id}/{object_id}"
             _mesh_info_cache.pop(cache_key, None)
         mesh_info = self._get_mesh_info(scene_id, object_id)
         
-        # 10. 加载已保存的关键点对（mesh 更新时丢弃旧点对）
+        # 8. 加载已保存的关键点对（mesh 更新时丢弃旧点对）
         saved_point_pairs = []
         pairs_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}/point_pairs.json"
         if os.path.exists(pairs_path) and not alignment_stale:
@@ -943,21 +1278,71 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             'frames': frames,
             'total_frames': total_frames,
             'gt_bbox': gt_bbox,
+            'obj_category': obj_category,
+            'obj_caption': obj_caption,
             'mesh_info': mesh_info,
             'point_pairs': saved_point_pairs
         }
+    
+    def _serve_depth_png(self, depth_path):
+        """读取 depth PNG 并返回 JSON（共用逻辑）"""
+        if not os.path.exists(depth_path):
+            self.send_error(404, f"Depth not found: {depth_path}")
+            return
+        import cv2
+        depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        if depth_img is not None:
+            if depth_img.dtype == np.uint16:
+                depth_float = depth_img.astype(np.float32) / 1000.0  # mm to m
+            else:
+                depth_float = depth_img.astype(np.float32)
+            response = {
+                'width': depth_float.shape[1],
+                'height': depth_float.shape[0],
+                'data': depth_float.flatten().tolist()
+            }
+            self.send_json(response)
+        else:
+            self.send_error(500, "Failed to read depth image")
     
     def serve_data_file(self, path):
         """服务数据文件"""
         parts = path.split('/')
         print(f"[serve_data_file] path={path}, parts={parts}")
         
-        if parts[0] == 'image':
-            # /data/image/{scene_id}/{object_id}/{subdir}/{filename}
+        if parts[0] == 'v3_image':
+            # /data/v3_image/{scene_id}/{object_id}/{idx}.png
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            file_path = f"{MV_SAM_V3_ROOT}/{scene_id}/{object_id}/images/{filename}"
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'image/png')
+            else:
+                self.send_error(404, f"v3 image not found: {file_path}")
+        
+        elif parts[0] == 'v3_mask':
+            # /data/v3_mask/{scene_id}/{object_id}/{idx}.png
+            scene_id, object_id, filename = parts[1], parts[2], parts[3]
+            file_path = f"{MV_SAM_V3_ROOT}/{scene_id}/{object_id}/{object_id}/{filename}"
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                self.send_binary(data, 'image/png')
+            else:
+                self.send_error(404, f"v3 mask not found: {file_path}")
+        
+        elif parts[0] == 'annotate_depth':
+            # /data/annotate_depth/{scene_id}/{object_id}/{idx}
+            scene_id, object_id, idx = parts[1], parts[2], parts[3]
+            depth_path = f"{ANNOTATE_ROOT}/{scene_id}/{object_id}/depth/{idx}.png"
+            self._serve_depth_png(depth_path)
+        
+        elif parts[0] == 'image':
+            # /data/image/{scene_id}/{object_id}/{subdir}/{filename} (legacy)
             try:
                 scene_id, object_id, subdir, filename = parts[1], parts[2], parts[3], parts[4]
                 file_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/{subdir}/{filename}"
-                print(f"[serve_data_file] image file_path={file_path}")
                 if os.path.exists(file_path):
                     with open(file_path, 'rb') as f:
                         data = f.read()
@@ -973,7 +1358,6 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
             # /data/mv_mesh/{scene_id}/{object_id}/mesh.glb
             scene_id, object_id, filename = parts[1], parts[2], parts[3]
             file_path = f"{MV_RECON_ROOT}/{scene_id}/{object_id}/{filename}"
-            print(f"[serve_data_file] mv_mesh file_path={file_path}")
             if os.path.exists(file_path):
                 with open(file_path, 'rb') as f:
                     data = f.read()
@@ -982,105 +1366,26 @@ class MVDataAPIHandler(SimpleHTTPRequestHandler):
                 self.send_error(404, f"Mesh not found: {file_path}")
         
         elif parts[0] == 'depth':
-            # /data/depth/{scene_id}/{object_id}/{frame_id}
+            # /data/depth/{scene_id}/{object_id}/{frame_id} (legacy)
             scene_id, object_id, frame_id = parts[1], parts[2], parts[3]
             depth_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}/gt/{frame_id}/depth.png"
-            
-            if os.path.exists(depth_path):
-                import cv2
-                depth_img = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-                if depth_img is not None:
-                    if depth_img.dtype == np.uint16:
-                        depth_float = depth_img.astype(np.float32) / 1000.0  # mm to m
-                    else:
-                        depth_float = depth_img.astype(np.float32)
-                    
-                    response = {
-                        'width': depth_float.shape[1],
-                        'height': depth_float.shape[0],
-                        'data': depth_float.flatten().tolist()
-                    }
-                    self.send_json(response)
-                else:
-                    self.send_error(500, "Failed to read depth image")
-            else:
-                self.send_error(404, f"Depth not found: {depth_path}")
+            self._serve_depth_png(depth_path)
         
         else:
             self.send_error(404, f"Unknown data type: {parts[0]}")
 
 
 def warmup_cache():
-    """启动时预热缓存（委托给 _build_mv_objects_cache 逻辑）"""
+    """启动时预热缓存（委托给 _build_mv_objects_cache）"""
     global _mv_objects_cache, _mv_objects_cache_time
     print("[warmup_cache] 正在预热缓存...")
     start_time = time.time()
     
-    # 使用与 _build_mv_objects_cache 相同的逻辑
-    mv_objects = []
-    for scene_dir in sorted(glob.glob(f"{MV_RECON_ROOT}/*")):
-        if not os.path.isdir(scene_dir):
-            continue
-        scene_id = os.path.basename(scene_dir)
-        
-        for obj_dir in sorted(glob.glob(f"{scene_dir}/*")):
-            if not os.path.isdir(obj_dir):
-                continue
-            object_id = os.path.basename(obj_dir)
-            
-            mesh_path = f"{obj_dir}/mesh.glb"
-            if not os.path.exists(mesh_path):
-                continue
-            
-            lasa_path = f"{LASA1M_ROOT}/{scene_id}/{object_id}"
-            if not os.path.exists(lasa_path):
-                continue
-            
-            # 缩略图
-            thumbnail_url = None
-            rgb_dir = f"{lasa_path}/raw_jpg"
-            rgb_files = sorted(glob.glob(f"{rgb_dir}/*.jpg"))
-            if rgb_files:
-                first_frame = os.path.basename(rgb_files[0])
-                thumbnail_url = f"/data/image/{scene_id}/{object_id}/raw_jpg/{first_frame}"
-            
-            aligned_path = f"{MV_ALIGNED_ROOT}/{scene_id}/{object_id}"
-            has_alignment = os.path.exists(f"{aligned_path}/world_pose.npy")
-            
-            # 读取result.json
-            category = None
-            num_point_pairs = 0
-            average_iou = 0.0
-            saved_at = None
-            result_path = f"{aligned_path}/result.json"
-            if os.path.exists(result_path):
-                try:
-                    with open(result_path, 'r') as f:
-                        result_data = json.load(f)
-                        category = result_data.get('category')
-                        num_point_pairs = result_data.get('num_point_pairs', 0)
-                        average_iou = result_data.get('average_iou', 0.0)
-                        saved_at = result_data.get('saved_at')
-                except:
-                    pass
-            
-            mv_objects.append({
-                'scene_id': scene_id,
-                'object_id': object_id,
-                'num_frames': -1,
-                'has_alignment': has_alignment,
-                'category': category,
-                'thumbnail_url': thumbnail_url,
-                'num_point_pairs': num_point_pairs,
-                'average_iou': average_iou,
-                'saved_at': saved_at
-            })
-    
-    mv_objects.sort(key=lambda x: (x['scene_id'], x['object_id']))
-    _mv_objects_cache = mv_objects
+    handler = MVDataAPIHandler.__new__(MVDataAPIHandler)
+    _mv_objects_cache = handler._build_mv_objects_cache()
     _mv_objects_cache_time = time.time()
     
-    print(f"[warmup_cache] 缓存预热完成，耗时 {time.time() - start_time:.2f}s，共 {len(mv_objects)} 个物体")
+    print(f"[warmup_cache] 缓存预热完成，耗时 {time.time() - start_time:.2f}s，共 {len(_mv_objects_cache)} 个物体")
 
 
 def run_server(port=8084):

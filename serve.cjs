@@ -32,8 +32,13 @@ const apiProxy = createProxyMiddleware({
 });
 app.use(['/api', '/data', `${PREFIX}/api`, `${PREFIX}/data`], apiProxy);
 
-// Block root and /scene/ paths BEFORE serving static files
-app.get(['/', '/scene', '/scene/', `${PREFIX}/`, `${PREFIX}/scene`, `${PREFIX}/scene/`], (req, res) => {
+// Block root and /scene/ paths BEFORE serving static files (but allow admin)
+app.get(['/', '/scene', '/scene/', `${PREFIX}/`, `${PREFIX}/scene`, `${PREFIX}/scene/`], (req, res, next) => {
+  // Skip if it's admin path
+  if (req.path === '/admin' || req.path === `${PREFIX}/admin` || 
+      req.path.startsWith('/admin/') || req.path.startsWith(`${PREFIX}/admin/`)) {
+    return next();
+  }
   console.log('[Block] Blocked access to:', req.path);
   res.status(404).send('');
 });
@@ -54,7 +59,7 @@ const staticOptions = {
 app.use(express.static(distPath, staticOptions));
 app.use(PREFIX, express.static(distPath, staticOptions));
 
-// SPA fallback - serve index-mv.html for MV routes only
+// SPA fallback - serve index-mv.html for MV routes, index-admin.html for admin routes
 app.use((req, res, next) => {
   console.log('[Fallback] Checking:', req.path);
   
@@ -65,16 +70,26 @@ app.use((req, res, next) => {
     return;
   }
   
-  // Only serve index-mv.html for MV app routes (starting with /mv/ or /cuhk-02/mv/)
   const ext = path.extname(req.path);
+  
+  // Serve index-admin.html for admin routes (starting with /admin/ or /cuhk-02/admin/)
+  if (!ext && (req.path.startsWith('/admin/') || req.path.startsWith(`${PREFIX}/admin/`) || req.path === '/admin' || req.path === `${PREFIX}/admin`)) {
+    const indexPath = path.join(__dirname, 'dist', 'index-admin.html');
+    console.log('[Fallback] Serving index-admin.html from:', indexPath);
+    res.sendFile(indexPath);
+    return;
+  }
+  
+  // Serve index-mv.html for MV app routes (starting with /mv/ or /cuhk-02/mv/)
   if (!ext && (req.path.startsWith('/mv/') || req.path.startsWith(`${PREFIX}/mv/`))) {
     const indexPath = path.join(__dirname, 'dist', 'index-mv.html');
     console.log('[Fallback] Serving index-mv.html from:', indexPath);
     res.sendFile(indexPath);
-  } else {
-    console.log('[Fallback] Passing through');
-    next();
+    return;
   }
+  
+  console.log('[Fallback] Passing through');
+  next();
 });
 
 app.listen(PORT, '0.0.0.0', () => {

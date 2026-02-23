@@ -73,7 +73,7 @@ export interface MVObjectItem {
   object_id: string;
   num_frames: number;
   has_alignment: boolean;
-  category?: 'valid' | 'fixed' | 'invalid' | null;
+  category?: 'valid' | 'fixed' | 'invalid' | 'align_difficult' | null;
   thumbnail_url?: string | null;
   num_point_pairs?: number;
   average_iou?: number;
