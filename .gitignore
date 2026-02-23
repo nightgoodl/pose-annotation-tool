@@ -18,3 +18,4 @@ logs/
 .idea/
 *.swp
 *.swo
+*.db
